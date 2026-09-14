@@ -4,6 +4,7 @@ HEIC → JPG Telegram Bot
 
 Features:
 - Owner: unlimited free conversions
+- Owner /admin command with user/account statistics
 - Other users: 5 free successful conversions per Bangladesh day
 - 50 Telegram Stars: 20 additional conversion credits
 - 150 Telegram Stars: 30 days unlimited
@@ -418,6 +419,165 @@ def record_payment(
             conn.close()
 
 
+
+# ===========================================================================
+# ADMIN / OWNER
+# ===========================================================================
+def get_admin_stats() -> dict:
+    """Return simple account/payment statistics for the owner."""
+    with db_lock:
+        conn = get_db()
+        try:
+            total_users = conn.execute(
+                "SELECT COUNT(*) AS c FROM users"
+            ).fetchone()["c"]
+
+            today = today_bd()
+            active_today = conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE free_date = ? AND free_used > 0",
+                (today,),
+            ).fetchone()["c"]
+
+            active_unlimited = conn.execute(
+                "SELECT COUNT(*) AS c FROM users "
+                "WHERE unlimited_until IS NOT NULL AND unlimited_until > ?",
+                (now_bd().isoformat(),),
+            ).fetchone()["c"]
+
+            total_paid_credits = conn.execute(
+                "SELECT COALESCE(SUM(paid_credits), 0) AS c FROM users"
+            ).fetchone()["c"]
+
+            payment_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM payments"
+            ).fetchone()["c"]
+
+            total_stars = conn.execute(
+                "SELECT COALESCE(SUM(stars), 0) AS c FROM payments"
+            ).fetchone()["c"]
+
+            recent_users = conn.execute(
+                "SELECT user_id, first_name, username, free_used, "
+                "paid_credits, unlimited_until "
+                "FROM users ORDER BY rowid DESC LIMIT 10"
+            ).fetchall()
+
+            return {
+                "total_users": total_users,
+                "active_today": active_today,
+                "active_unlimited": active_unlimited,
+                "total_paid_credits": total_paid_credits,
+                "payment_count": payment_count,
+                "total_stars": total_stars,
+                "recent_users": recent_users,
+            }
+        finally:
+            conn.close()
+
+
+def format_admin_user(row: sqlite3.Row) -> str:
+    """Format one user row without Markdown so usernames cannot break formatting."""
+    user_id = row["user_id"]
+    first_name = row["first_name"] or "(no name)"
+    username = row["username"] or "(no username)"
+    free_used = row["free_used"]
+    paid_credits = row["paid_credits"]
+    unlimited_until = row["unlimited_until"]
+
+    if unlimited_until:
+        try:
+            until = datetime.fromisoformat(unlimited_until)
+            if until > now_bd():
+                plan = f"Unlimited until {until.strftime('%d-%m-%Y %I:%M %p')}"
+            else:
+                plan = "Free / expired unlimited"
+        except ValueError:
+            plan = "Free"
+    else:
+        plan = "Free"
+
+    return (
+        f"👤 {first_name}\n"
+        f"🆔 ID: {user_id}\n"
+        f"🔗 Username: @{username.lstrip('@') if username != '(no username)' else '(no username)'}\n"
+        f"🆓 Used today: {free_used}/{FREE_DAILY_LIMIT}\n"
+        f"⭐ Paid credits: {paid_credits}\n"
+        f"📦 Plan: {plan}"
+    )
+
+
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Owner-only admin dashboard. /admin or /admin USER_ID."""
+    if not update.message or not update.effective_user:
+        return
+
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text(
+            "⛔ This command is available only to the bot administrator."
+        )
+        return
+
+    # /admin USER_ID -> show a specific user's stored information.
+    if context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID.\n\nExample:\n/admin 123456789"
+            )
+            return
+
+        row = get_user_row(target_id)
+        if row is None:
+            await update.message.reply_text(
+                f"🔎 No stored account found for user ID: {target_id}"
+            )
+            return
+
+        await update.message.reply_text(
+            "🔐 USER INFORMATION\n\n" + format_admin_user(row)
+        )
+        return
+
+    stats = get_admin_stats()
+
+    lines = [
+        "🔐 ADMIN DASHBOARD",
+        "",
+        f"👑 Owner ID: {OWNER_ID}",
+        f"👥 Total registered users: {stats['total_users']}",
+        f"📈 Users with conversion today: {stats['active_today']}",
+        f"♾️ Active unlimited users: {stats['active_unlimited']}",
+        f"⭐ Remaining paid credits (all users): {stats['total_paid_credits']}",
+        f"💳 Successful payments: {stats['payment_count']}",
+        f"🌟 Total Stars received: {stats['total_stars']}",
+        "",
+        "🕘 RECENT USERS",
+    ]
+
+    if not stats["recent_users"]:
+        lines.append("No users registered yet.")
+    else:
+        for i, row in enumerate(stats["recent_users"], start=1):
+            username = row["username"] or "(no username)"
+            name = row["first_name"] or "(no name)"
+            lines.append(
+                f"{i}. {name} | @{username.lstrip('@') if username != '(no username)' else '(no username)'} "
+                f"| ID: {row['user_id']}"
+            )
+
+    lines.extend([
+        "",
+        "ℹ️ To inspect a user:",
+        "/admin USER_ID",
+    ])
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ===========================================================================
 # CUSTOM EXCEPTIONS
 # ===========================================================================
@@ -460,16 +620,17 @@ def plans_keyboard() -> InlineKeyboardMarkup:
 
 def plans_text() -> str:
     return (
-        "💰 *Plans*\n\n"
-        "🆓 *Free*\n"
-        "• 5 successful conversions every day\n\n"
-        "⭐ *20 Conversions*\n"
-        "• 20 additional conversions\n"
-        "• Price: 50 Telegram Stars\n\n"
-        "♾️ *30 Days Unlimited*\n"
-        "• Unlimited conversions for 30 days\n"
-        "• Price: 150 Telegram Stars\n\n"
-        "Choose a plan below:"
+        "💰 *Available Plans*\\n\\n"
+        "🆓 *Free Plan*\\n"
+        "• 5 successful conversions every day\\n"
+        "• Resets automatically each Bangladesh day\\n\\n"
+        "⭐ *20 Conversions*\\n"
+        "• 20 additional conversions\\n"
+        "• Price: *50 Telegram Stars*\\n\\n"
+        "♾️ *30 Days Unlimited*\\n"
+        "• Unlimited conversions for 30 days\\n"
+        "• Price: *150 Telegram Stars*\\n\\n"
+        "💳 Choose a plan below to continue."
     )
 
 
@@ -504,13 +665,17 @@ async def start_command(
     ensure_user(update.effective_user)
 
     await update.message.reply_text(
-        "👋 *Welcome to HEIC → JPG Converter!*\n\n"
-        "📸 Send a `.HEIC` or `.HEIF` file as a *document*.\n\n"
-        "🆓 Other users get 5 free successful conversions every day.\n"
-        "👑 Owner has unlimited access.\n"
-        "⭐ Use /plans to buy more conversions.\n"
-        "📊 Use /status to check your balance.\n\n"
-        "🔒 Files are deleted after conversion.",
+        "👋 *Welcome to HEIC → JPG Converter!*\\n\\n"
+        "📸 Convert your HEIC & HEIF images to JPG quickly and easily.\\n\\n"
+        "📎 *How to convert:*\\n"
+        "Send your `.HEIC` or `.HEIF` file as a *document* (📎 → File).\\n\\n"
+        "✨ Fast and easy conversion\\n"
+        "🆓 5 free successful conversions every day\\n"
+        "🔒 Your uploaded file is deleted after conversion\\n\\n"
+        "📊 Check your remaining conversions: /status\\n"
+        "💰 Need more conversions? Use /plans\\n"
+        "❓ Need help? Use /help\\n\\n"
+        "🚀 Send your HEIC file to get started!",
         parse_mode="Markdown",
     )
 
@@ -523,17 +688,21 @@ async def help_command(
         return
 
     await update.message.reply_text(
-        "📸 *HEIC → JPG Converter*\n\n"
-        "*How to use:*\n"
-        "1. Tap 📎 attachment\n"
-        "2. Choose *File* (not Photo)\n"
-        "3. Select `.HEIC` or `.HEIF`\n"
-        "4. Wait for the JPG\n\n"
-        "*Commands:*\n"
-        "/start – Start bot\n"
-        "/help – Help\n"
-        "/plans – Buy a plan\n"
-        "/status – Check remaining quota",
+        "📸 *HEIC → JPG Converter*\\n\\n"
+        "*How to use:*\\n"
+        "1️⃣ Tap 📎 Attachment\\n"
+        "2️⃣ Choose *File* — not Photo\\n"
+        "3️⃣ Select your `.HEIC` or `.HEIF` file\\n"
+        "4️⃣ Send it and wait for the JPG\\n\\n"
+        "*Free usage:*\\n"
+        "🆓 You can make up to *5 successful conversions per day*.\\n"
+        "Only successful conversions count.\\n\\n"
+        "*Commands:*\\n"
+        "/start – Welcome & instructions\\n"
+        "/help – How to use the bot\\n"
+        "/plans – View available plans\\n"
+        "/status – Check your remaining conversions\\n\\n"
+        "🔒 Files are automatically deleted after conversion.",
         parse_mode="Markdown",
     )
 
@@ -561,11 +730,33 @@ async def status_command(
 
     ensure_user(update.effective_user)
 
-    await update.message.reply_text(
-        "📊 *Your Conversion Status*\n\n"
-        + entitlement_text(update.effective_user.id),
-        parse_mode="Markdown",
-    )
+    row = ensure_user(update.effective_user)
+
+    if update.effective_user.id == OWNER_ID:
+        text = (
+            "📊 *Your Conversion Status*\\n\\n"
+            "♾️ Unlimited access is active.\\n"
+            "👑 You can convert without a daily limit."
+        )
+    elif unlimited_active(row):
+        until = datetime.fromisoformat(row["unlimited_until"])
+        text = (
+            "📊 *Your Conversion Status*\\n\\n"
+            "♾️ *Unlimited plan active*\\n"
+            f"⏰ Valid until: {until.strftime('%d-%m-%Y %I:%M %p')}\\n\\n"
+            "You can convert without a daily limit."
+        )
+    else:
+        free_left = max(0, FREE_DAILY_LIMIT - row["free_used"])
+        credits = row["paid_credits"]
+        text = (
+            "📊 *Your Conversion Status*\\n\\n"
+            f"🆓 Free conversions left today: *{free_left} / {FREE_DAILY_LIMIT}*\\n"
+            f"⭐ Paid conversion credits: *{credits}*\\n\\n"
+            "💰 Need more? Use /plans"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ===========================================================================
@@ -634,6 +825,7 @@ async def successful_payment_handler(
     if not payment:
         return
 
+    ensure_user(update.effective_user)
     user_id = update.effective_user.id
     payload = payment.invoice_payload
     charge_id = payment.telegram_payment_charge_id
@@ -661,8 +853,8 @@ async def successful_payment_handler(
     if payload == "plan_20":
         add_paid_credits(user_id, PAID_CREDIT_PACK)
         await update.message.reply_text(
-            "✅ *Payment successful!*\n\n"
-            "⭐ 20 conversion credits have been added.\n\n"
+            "🎉 *Payment successful!*\n\n"
+            "⭐ *20 conversion credits* have been added to your account.\n\n"
             + entitlement_text(user_id),
             parse_mode="Markdown",
         )
@@ -670,8 +862,8 @@ async def successful_payment_handler(
     elif payload == "plan_unlimited_30":
         activate_unlimited(user_id)
         await update.message.reply_text(
-            "✅ *Payment successful!*\n\n"
-            "♾️ Your 30-day Unlimited plan is now active.\n\n"
+            "🎉 *Payment successful!*\n\n"
+            "♾️ Your *30-day Unlimited plan* is now active.\n\n"
             + entitlement_text(user_id),
             parse_mode="Markdown",
         )
@@ -688,9 +880,9 @@ async def handle_photo(
         return
 
     await update.message.reply_text(
-        "ℹ️ Please send the original HEIC image as a *document* "
+        "ℹ️ Please send your HEIC image as a *document* "
         "(📎 → File), not as a Telegram photo.\n\n"
-        "This preserves the original quality.",
+        "📎 Tap Attachment → File → select the HEIC/HEIF file.",
         parse_mode="Markdown",
     )
 
@@ -715,9 +907,9 @@ async def handle_document(
 
     if not allowed:
         await message.reply_text(
-            "🚫 *Daily free limit reached.*\n\n"
-            "You have used all 5 free conversions for today.\n\n"
-            "Choose a paid plan to continue:",
+            "🚫 *Your free conversions are finished for today.*\n\n"
+            "You have used all 5 free conversions available today.\n\n"
+            "💰 Choose a paid plan below to continue converting:",
             parse_mode="Markdown",
             reply_markup=plans_keyboard(),
         )
@@ -732,7 +924,7 @@ async def handle_document(
     if not is_supported_file(filename):
         await message.reply_text(
             "❌ *Unsupported file type.*\n\n"
-            "Please send a `.HEIC` or `.HEIF` file.",
+            "Please send a `.HEIC` or `.HEIF` file as a document.",
             parse_mode="Markdown",
         )
         return
@@ -743,7 +935,7 @@ async def handle_document(
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply_text(
             f"❌ *File too large.*\n"
-            f"Maximum allowed size is {MAX_FILE_SIZE_MB} MB.",
+            f"Maximum allowed size is {MAX_FILE_SIZE_MB} MB. Please choose a smaller file.",
             parse_mode="Markdown",
         )
         return
@@ -788,7 +980,8 @@ async def handle_document(
         logger.warning("Conversion failed for user %s", user.id)
         await message.reply_text(
             "❌ *Conversion failed.*\n\n"
-            "The file may be corrupted or use an unsupported HEIC variant.",
+            "The file may be corrupted or use an unsupported HEIC variant. "
+            "Please try another HEIC/HEIF file.",
             parse_mode="Markdown",
         )
 
@@ -863,6 +1056,7 @@ def main() -> None:
     # Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("plans", plans_command))
     application.add_handler(CommandHandler("status", status_command))
 
@@ -892,6 +1086,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info("Bot is running. Send /start on Telegram.")
+    logger.info("Owner admin command enabled: /admin")
     logger.info("=" * 60)
 
     application.run_polling(
