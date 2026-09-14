@@ -127,10 +127,16 @@ def init_database() -> None:
                     free_date TEXT NOT NULL,
                     free_used INTEGER NOT NULL DEFAULT 0,
                     paid_credits INTEGER NOT NULL DEFAULT 0,
-                    unlimited_until TEXT
+                    unlimited_until TEXT,
+                    registered_at TEXT,
+                    last_seen_at TEXT,
+                    total_conversions INTEGER NOT NULL DEFAULT 0,
+                    successful_conversions INTEGER NOT NULL DEFAULT 0,
+                    failed_conversions INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payments (
@@ -142,6 +148,46 @@ def init_database() -> None:
                     created_at TEXT NOT NULL
                 )
                 """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    filename TEXT,
+                    status TEXT NOT NULL,
+                    quota_source TEXT,
+                    file_size INTEGER,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+            # Migrate databases created by older bot versions.
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            columns = {
+                "registered_at": "TEXT",
+                "last_seen_at": "TEXT",
+                "total_conversions": "INTEGER NOT NULL DEFAULT 0",
+                "successful_conversions": "INTEGER NOT NULL DEFAULT 0",
+                "failed_conversions": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+
+            now = now_bd().isoformat()
+            conn.execute(
+                "UPDATE users SET registered_at = COALESCE(registered_at, ?)",
+                (now,),
+            )
+            conn.execute(
+                "UPDATE users SET last_seen_at = COALESCE(last_seen_at, ?)",
+                (now,),
             )
             conn.commit()
         finally:
@@ -159,6 +205,7 @@ def now_bd() -> datetime:
 def ensure_user(user) -> sqlite3.Row:
     user_id = user.id
     today = today_bd()
+    now = now_bd().isoformat()
 
     with db_lock:
         conn = get_db()
@@ -172,26 +219,32 @@ def ensure_user(user) -> sqlite3.Row:
                 conn.execute(
                     """
                     INSERT INTO users
-                    (user_id, first_name, username, free_date, free_used)
-                    VALUES (?, ?, ?, ?, 0)
+                    (
+                        user_id, first_name, username, free_date, free_used,
+                        registered_at, last_seen_at
+                    )
+                    VALUES (?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         user_id,
                         user.first_name or "",
                         user.username or "",
                         today,
+                        now,
+                        now,
                     ),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE users
-                    SET first_name = ?, username = ?
+                    SET first_name = ?, username = ?, last_seen_at = ?
                     WHERE user_id = ?
                     """,
                     (
                         user.first_name or "",
                         user.username or "",
+                        now,
                         user_id,
                     ),
                 )
@@ -207,7 +260,6 @@ def ensure_user(user) -> sqlite3.Row:
                     )
 
             conn.commit()
-
             return conn.execute(
                 "SELECT * FROM users WHERE user_id = ?",
                 (user_id,),
@@ -424,24 +476,47 @@ def record_payment(
 # ADMIN / OWNER
 # ===========================================================================
 def get_admin_stats() -> dict:
-    """Return simple account/payment statistics for the owner."""
     with db_lock:
         conn = get_db()
         try:
+            now = now_bd().isoformat()
+            today = today_bd()
+
             total_users = conn.execute(
                 "SELECT COUNT(*) AS c FROM users"
             ).fetchone()["c"]
 
-            today = today_bd()
             active_today = conn.execute(
                 "SELECT COUNT(*) AS c FROM users WHERE free_date = ? AND free_used > 0",
                 (today,),
             ).fetchone()["c"]
 
+            total_attempts = conn.execute(
+                "SELECT COUNT(*) AS c FROM conversions"
+            ).fetchone()["c"]
+
+            total_success = conn.execute(
+                "SELECT COUNT(*) AS c FROM conversions WHERE status = 'success'"
+            ).fetchone()["c"]
+
+            total_failed = conn.execute(
+                "SELECT COUNT(*) AS c FROM conversions WHERE status = 'failed'"
+            ).fetchone()["c"]
+
             active_unlimited = conn.execute(
-                "SELECT COUNT(*) AS c FROM users "
-                "WHERE unlimited_until IS NOT NULL AND unlimited_until > ?",
-                (now_bd().isoformat(),),
+                """
+                SELECT COUNT(*) AS c FROM users
+                WHERE unlimited_until IS NOT NULL AND unlimited_until > ?
+                """,
+                (now,),
+            ).fetchone()["c"]
+
+            expired_unlimited = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM users
+                WHERE unlimited_until IS NOT NULL AND unlimited_until <= ?
+                """,
+                (now,),
             ).fetchone()["c"]
 
             total_paid_credits = conn.execute(
@@ -456,61 +531,166 @@ def get_admin_stats() -> dict:
                 "SELECT COALESCE(SUM(stars), 0) AS c FROM payments"
             ).fetchone()["c"]
 
-            recent_users = conn.execute(
-                "SELECT user_id, first_name, username, free_used, "
-                "paid_credits, unlimited_until "
-                "FROM users ORDER BY rowid DESC LIMIT 10"
+            users = conn.execute(
+                "SELECT * FROM users ORDER BY last_seen_at DESC, rowid DESC"
             ).fetchall()
 
             return {
                 "total_users": total_users,
                 "active_today": active_today,
+                "total_attempts": total_attempts,
+                "total_success": total_success,
+                "total_failed": total_failed,
                 "active_unlimited": active_unlimited,
+                "expired_unlimited": expired_unlimited,
                 "total_paid_credits": total_paid_credits,
                 "payment_count": payment_count,
                 "total_stars": total_stars,
-                "recent_users": recent_users,
+                "users": users,
             }
         finally:
             conn.close()
 
 
-def format_admin_user(row: sqlite3.Row) -> str:
-    """Format one user row without Markdown so usernames cannot break formatting."""
-    user_id = row["user_id"]
-    first_name = row["first_name"] or "(no name)"
-    username = row["username"] or "(no username)"
-    free_used = row["free_used"]
-    paid_credits = row["paid_credits"]
-    unlimited_until = row["unlimited_until"]
+def _dt_display(value) -> str:
+    if not value:
+        return "Unknown"
+    try:
+        return datetime.fromisoformat(value).strftime("%d-%m-%Y %I:%M:%S %p")
+    except (ValueError, TypeError):
+        return str(value)
 
+
+def admin_user_text(row: sqlite3.Row) -> str:
+    user_id = row["user_id"]
+    name = row["first_name"] or "(no name)"
+    username = row["username"] or "(no username)"
+
+    current = get_user_row(user_id)
+    free_used = current["free_used"] if current else row["free_used"]
+    paid_credits = current["paid_credits"] if current else row["paid_credits"]
+
+    unlimited_until = row["unlimited_until"]
     if unlimited_until:
         try:
             until = datetime.fromisoformat(unlimited_until)
             if until > now_bd():
-                plan = f"Unlimited until {until.strftime('%d-%m-%Y %I:%M %p')}"
+                plan = f"♾️ ACTIVE until {_dt_display(unlimited_until)}"
             else:
-                plan = "Free / expired unlimited"
+                plan = f"⏳ EXPIRED at {_dt_display(unlimited_until)}"
         except ValueError:
-            plan = "Free"
+            plan = f"♾️ {unlimited_until}"
     else:
-        plan = "Free"
+        plan = "🆓 Free plan only"
 
-    return (
-        f"👤 {first_name}\n"
-        f"🆔 ID: {user_id}\n"
-        f"🔗 Username: @{username.lstrip('@') if username != '(no username)' else '(no username)'}\n"
-        f"🆓 Used today: {free_used}/{FREE_DAILY_LIMIT}\n"
-        f"⭐ Paid credits: {paid_credits}\n"
-        f"📦 Plan: {plan}"
-    )
+    payments = payment_summary(user_id)
+    conversions = conversion_summary(user_id)
+
+    lines = [
+        "🔐 USER ACCOUNT DETAILS",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"👤 Name: {name}",
+        f"🔗 Username: @{username.lstrip('@') if username != '(no username)' else '(no username)'}",
+        f"🆔 Telegram ID: {user_id}",
+        "",
+        "📅 ACCOUNT",
+        f"• Registered: {_dt_display(row['registered_at'])} (BD time)",
+        f"• Last seen: {_dt_display(row['last_seen_at'])} (BD time)",
+        "",
+        "📊 CURRENT BALANCE",
+        f"• Free used today: {free_used}/{FREE_DAILY_LIMIT}",
+        f"• Free remaining today: {max(0, FREE_DAILY_LIMIT - free_used)}",
+        f"• Paid credits remaining: {paid_credits}",
+        "",
+        "🔄 CONVERSION HISTORY",
+        f"• Total attempts: {conversions['total']}",
+        f"• Successful: {conversions['successful']}",
+        f"• Failed: {conversions['failed']}",
+        "",
+        "📦 PLAN",
+        f"• {plan}",
+        "",
+        "💳 PAYMENT HISTORY",
+        f"• Successful payments: {payments['count']}",
+        f"• Total Stars paid: {payments['stars']}",
+    ]
+
+    if payments["payments"]:
+        lines.append("• Recent payments:")
+        for pay in payments["payments"]:
+            plan_name = {
+                "plan_20": "20 Conversions",
+                "plan_unlimited_30": "30 Days Unlimited",
+            }.get(pay["payload"], pay["payload"])
+            lines.append(
+                f"  - {plan_name} | ⭐ {pay['stars']} | "
+                f"{_dt_display(pay['created_at'])}"
+            )
+    else:
+        lines.append("• No payment found")
+
+    if conversions["recent"]:
+        lines.extend(["", "🗂️ RECENT CONVERSION ACTIVITY"])
+        for item in conversions["recent"]:
+            icon = "✅" if item["status"] == "success" else "❌"
+            filename = item["filename"] or "(unknown)"
+            source = item["quota_source"] or "-"
+            size = item["file_size"] if item["file_size"] is not None else "-"
+            lines.append(
+                f"{icon} {filename} | {source} | {size} bytes | "
+                f"{_dt_display(item['created_at'])}"
+            )
+
+    return "\n".join(lines)
+
+
+def admin_all_users_chunks(users: list[sqlite3.Row]) -> list[str]:
+    chunks = []
+    current = ["👥 ALL REGISTERED USERS", "━━━━━━━━━━━━━━━━━━━━", ""]
+
+    for index, row in enumerate(users, start=1):
+        name = row["first_name"] or "(no name)"
+        username = row["username"] or "(no username)"
+        unlimited = row["unlimited_until"]
+
+        if unlimited:
+            try:
+                until = datetime.fromisoformat(unlimited)
+                plan = f"♾️ {until.strftime('%d-%m-%Y')}" if until > now_bd() else "⏳ Expired"
+            except ValueError:
+                plan = "♾️"
+        else:
+            plan = "🆓 Free"
+
+        item = (
+            f"{index}. {name} | @{username.lstrip('@') if username != '(no username)' else '(no username)'}\n"
+            f"   🆔 {row['user_id']} | 🆓 {row['free_used']}/{FREE_DAILY_LIMIT} | "
+            f"⭐ {row['paid_credits']} | {plan}\n"
+            f"   🔄 {row['total_conversions']} total | "
+            f"✅ {row['successful_conversions']} | ❌ {row['failed_conversions']}\n"
+        )
+
+        if len("\n".join(current)) + len(item) > 3600:
+            chunks.append("\n".join(current))
+            current = ["👥 ALL REGISTERED USERS", "━━━━━━━━━━━━━━━━━━━━", ""]
+        current.append(item)
+
+    if len(current) > 3:
+        chunks.append("\n".join(current))
+    return chunks
 
 
 async def admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Owner-only admin dashboard. /admin or /admin USER_ID."""
+    """
+    Owner-only:
+      /admin              -> dashboard
+      /admin users        -> every registered user
+      /admin USER_ID      -> complete details for one user
+    """
     if not update.message or not update.effective_user:
         return
 
@@ -520,13 +700,35 @@ async def admin_command(
         )
         return
 
-    # /admin USER_ID -> show a specific user's stored information.
-    if context.args:
+    args = context.args
+
+    if args and args[0].lower() == "users":
+        stats = get_admin_stats()
+        chunks = admin_all_users_chunks(stats["users"])
+
+        if not chunks:
+            await update.message.reply_text("👥 No registered users yet.")
+            return
+
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+
+        await update.message.reply_text(
+            f"📌 Total registered users: {stats['total_users']}\n\n"
+            "Use /admin USER_ID for complete details of a user."
+        )
+        return
+
+    if args:
         try:
-            target_id = int(context.args[0])
+            target_id = int(args[0])
         except ValueError:
             await update.message.reply_text(
-                "❌ Invalid user ID.\n\nExample:\n/admin 123456789"
+                "❌ Invalid command.\n\n"
+                "Use:\n"
+                "/admin\n"
+                "/admin users\n"
+                "/admin USER_ID"
             )
             return
 
@@ -537,43 +739,59 @@ async def admin_command(
             )
             return
 
-        await update.message.reply_text(
-            "🔐 USER INFORMATION\n\n" + format_admin_user(row)
-        )
+        text = admin_user_text(row)
+        for i in range(0, len(text), 3800):
+            await update.message.reply_text(text[i:i + 3800])
         return
 
     stats = get_admin_stats()
 
     lines = [
         "🔐 ADMIN DASHBOARD",
+        "━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"👑 Owner ID: {OWNER_ID}",
         f"👥 Total registered users: {stats['total_users']}",
-        f"📈 Users with conversion today: {stats['active_today']}",
-        f"♾️ Active unlimited users: {stats['active_unlimited']}",
-        f"⭐ Remaining paid credits (all users): {stats['total_paid_credits']}",
-        f"💳 Successful payments: {stats['payment_count']}",
-        f"🌟 Total Stars received: {stats['total_stars']}",
+        f"📈 Users who converted today: {stats['active_today']}",
         "",
-        "🕘 RECENT USERS",
+        "🔄 CONVERSIONS",
+        f"• Total attempts: {stats['total_attempts']}",
+        f"• Successful: {stats['total_success']}",
+        f"• Failed: {stats['total_failed']}",
+        "",
+        "📦 PLANS",
+        f"• Active unlimited users: {stats['active_unlimited']}",
+        f"• Expired unlimited accounts: {stats['expired_unlimited']}",
+        f"• Remaining paid credits: {stats['total_paid_credits']}",
+        "",
+        "💳 PAYMENTS",
+        f"• Successful payments: {stats['payment_count']}",
+        f"• Total Stars received: {stats['total_stars']}",
+        "",
+        "👤 RECENT USERS",
     ]
 
-    if not stats["recent_users"]:
-        lines.append("No users registered yet.")
-    else:
-        for i, row in enumerate(stats["recent_users"], start=1):
-            username = row["username"] or "(no username)"
+    if stats["users"]:
+        for i, row in enumerate(stats["users"][:10], start=1):
             name = row["first_name"] or "(no name)"
+            username = row["username"] or "(no username)"
             lines.append(
-                f"{i}. {name} | @{username.lstrip('@') if username != '(no username)' else '(no username)'} "
-                f"| ID: {row['user_id']}"
+                f"{i}. {name} | @{username.lstrip('@') if username != '(no username)' else '(no username)'}"
             )
+            lines.append(
+                f"   ID: {row['user_id']} | Free: {row['free_used']}/{FREE_DAILY_LIMIT} | "
+                f"Paid: {row['paid_credits']} | Total: {row['total_conversions']}"
+            )
+    else:
+        lines.append("No users registered yet.")
 
-    lines.extend([
-        "",
-        "ℹ️ To inspect a user:",
-        "/admin USER_ID",
-    ])
+    lines.extend(
+        [
+            "",
+            "📌 COMMANDS",
+            "• /admin users — all registered users",
+            "• /admin USER_ID — complete user information",
+        ]
+    )
 
     await update.message.reply_text("\n".join(lines))
 
@@ -620,16 +838,16 @@ def plans_keyboard() -> InlineKeyboardMarkup:
 
 def plans_text() -> str:
     return (
-        "💰 *Available Plans*\\n\\n"
-        "🆓 *Free Plan*\\n"
-        "• 5 successful conversions every day\\n"
-        "• Resets automatically each Bangladesh day\\n\\n"
-        "⭐ *20 Conversions*\\n"
-        "• 20 additional conversions\\n"
-        "• Price: *50 Telegram Stars*\\n\\n"
-        "♾️ *30 Days Unlimited*\\n"
-        "• Unlimited conversions for 30 days\\n"
-        "• Price: *150 Telegram Stars*\\n\\n"
+        "💰 *Available Plans*\n\n"
+        "🆓 *Free Plan*\n"
+        "• 5 successful conversions every day\n"
+        "• Resets automatically each Bangladesh day\n\n"
+        "⭐ *20 Conversions*\n"
+        "• 20 additional conversions\n"
+        "• Price: *50 Telegram Stars*\n\n"
+        "♾️ *30 Days Unlimited*\n"
+        "• Unlimited conversions for 30 days\n"
+        "• Price: *150 Telegram Stars*\n\n"
         "💳 Choose a plan below to continue."
     )
 
@@ -665,17 +883,20 @@ async def start_command(
     ensure_user(update.effective_user)
 
     await update.message.reply_text(
-        "👋 *Welcome to HEIC → JPG Converter!*\\n\\n"
-        "📸 Convert your HEIC & HEIF images to JPG quickly and easily.\\n\\n"
-        "📎 *How to convert:*\\n"
-        "Send your `.HEIC` or `.HEIF` file as a *document* (📎 → File).\\n\\n"
-        "✨ Fast and easy conversion\\n"
-        "🆓 5 free successful conversions every day\\n"
-        "🔒 Your uploaded file is deleted after conversion\\n\\n"
-        "📊 Check your remaining conversions: /status\\n"
-        "💰 Need more conversions? Use /plans\\n"
-        "❓ Need help? Use /help\\n\\n"
-        "🚀 Send your HEIC file to get started!",
+        "👋 *Welcome to HEIC → JPG Converter!*\n\n"
+        "📸 *Convert HEIC & HEIF images to JPG — fast and easy.*\n\n"
+        "📎 *How to convert:*\n"
+        "1️⃣ Tap 📎 Attachment\n"
+        "2️⃣ Select *File* (not Photo)\n"
+        "3️⃣ Choose your `.HEIC` or `.HEIF` file\n"
+        "4️⃣ Send it — your JPG will be ready shortly\n\n"
+        "🆓 *Free:* 5 successful conversions every day\n"
+        "⚡ Fast conversion\n"
+        "🔒 Your uploaded file is deleted after conversion\n\n"
+        "📊 Check your balance: /status\n"
+        "💰 Get more conversions: /plans\n"
+        "❓ Help & instructions: /help\n\n"
+        "🚀 *Send your HEIC file now to get started!*",
         parse_mode="Markdown",
     )
 
@@ -688,20 +909,20 @@ async def help_command(
         return
 
     await update.message.reply_text(
-        "📸 *HEIC → JPG Converter*\\n\\n"
-        "*How to use:*\\n"
-        "1️⃣ Tap 📎 Attachment\\n"
-        "2️⃣ Choose *File* — not Photo\\n"
-        "3️⃣ Select your `.HEIC` or `.HEIF` file\\n"
-        "4️⃣ Send it and wait for the JPG\\n\\n"
-        "*Free usage:*\\n"
-        "🆓 You can make up to *5 successful conversions per day*.\\n"
-        "Only successful conversions count.\\n\\n"
-        "*Commands:*\\n"
-        "/start – Welcome & instructions\\n"
-        "/help – How to use the bot\\n"
-        "/plans – View available plans\\n"
-        "/status – Check your remaining conversions\\n\\n"
+        "📸 *HEIC → JPG Converter*\n\n"
+        "*How to use:*\n"
+        "1️⃣ Tap 📎 Attachment\n"
+        "2️⃣ Choose *File* — not Photo\n"
+        "3️⃣ Select your `.HEIC` or `.HEIF` file\n"
+        "4️⃣ Send it and wait for the JPG\n\n"
+        "*Free usage:*\n"
+        "🆓 You can make up to *5 successful conversions per day*.\n"
+        "Only successful conversions count.\n\n"
+        "*Commands:*\n"
+        "/start – Welcome & instructions\n"
+        "/help – How to use the bot\n"
+        "/plans – View available plans\n"
+        "/status – Check your remaining conversions\n\n"
         "🔒 Files are automatically deleted after conversion.",
         parse_mode="Markdown",
     )
@@ -734,25 +955,25 @@ async def status_command(
 
     if update.effective_user.id == OWNER_ID:
         text = (
-            "📊 *Your Conversion Status*\\n\\n"
-            "♾️ Unlimited access is active.\\n"
+            "📊 *Your Conversion Status*\n\n"
+            "♾️ Unlimited access is active.\n"
             "👑 You can convert without a daily limit."
         )
     elif unlimited_active(row):
         until = datetime.fromisoformat(row["unlimited_until"])
         text = (
-            "📊 *Your Conversion Status*\\n\\n"
-            "♾️ *Unlimited plan active*\\n"
-            f"⏰ Valid until: {until.strftime('%d-%m-%Y %I:%M %p')}\\n\\n"
+            "📊 *Your Conversion Status*\n\n"
+            "♾️ *Unlimited plan active*\n"
+            f"⏰ Valid until: {until.strftime('%d-%m-%Y %I:%M %p')}\n\n"
             "You can convert without a daily limit."
         )
     else:
         free_left = max(0, FREE_DAILY_LIMIT - row["free_used"])
         credits = row["paid_credits"]
         text = (
-            "📊 *Your Conversion Status*\\n\\n"
-            f"🆓 Free conversions left today: *{free_left} / {FREE_DAILY_LIMIT}*\\n"
-            f"⭐ Paid conversion credits: *{credits}*\\n\\n"
+            "📊 *Your Conversion Status*\n\n"
+            f"🆓 Free conversions left today: *{free_left} / {FREE_DAILY_LIMIT}*\n"
+            f"⭐ Paid conversion credits: *{credits}*\n\n"
             "💰 Need more? Use /plans"
         )
 
@@ -826,6 +1047,7 @@ async def successful_payment_handler(
         return
 
     ensure_user(update.effective_user)
+    ensure_user(update.effective_user)
     user_id = update.effective_user.id
     payload = payment.invoice_payload
     charge_id = payment.telegram_payment_charge_id
@@ -898,6 +1120,8 @@ async def handle_document(
         return
 
     ensure_user(user)
+    document = message.document
+    filename = document.file_name or "image.heic"
 
     # -----------------------------------------------------------------------
     # Check quota BEFORE downloading/converting.
@@ -914,9 +1138,6 @@ async def handle_document(
             reply_markup=plans_keyboard(),
         )
         return
-
-    document = message.document
-    filename = document.file_name or "image.heic"
 
     # -----------------------------------------------------------------------
     # Validate extension
@@ -996,6 +1217,21 @@ async def handle_document(
         # IMPORTANT: quota is consumed only after a successful conversion.
         if conversion_succeeded:
             consume_conversion(user.id, source)
+            record_conversion(
+                user_id=user.id,
+                filename=filename,
+                status="success",
+                quota_source=source,
+                file_size=document.file_size,
+            )
+        else:
+            record_conversion(
+                user_id=user.id,
+                filename=filename,
+                status="failed",
+                quota_source=source,
+                file_size=document.file_size,
+            )
 
         safe_unlink(input_file)
         safe_unlink(output_file)
