@@ -3,8 +3,11 @@ HEIC → JPG Telegram Bot
 =======================
 
 Features:
+- Persistent storage via DATA_DIR (Render Persistent Disk at /var/data)
 - Owner: unlimited free conversions
-- Owner /admin command with user/account statistics
+- Owner /admin dashboard, /admin users, /admin USER_ID
+- Owner /admin backup — download live database backup
+- Owner /admin restore — restore database from an uploaded .db file
 - Other users: 5 free successful conversions per Bangladesh day
 - 50 Telegram Stars: 20 additional conversion credits
 - 150 Telegram Stars: 30 days unlimited
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -38,7 +42,7 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# FLASK APP
+# FLASK APP (health check for Render + UptimeRobot)
 # ===========================================================================
 flask_app = Flask(__name__)
 
@@ -57,10 +61,6 @@ def run_flask() -> None:
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
-# IMPORTANT:
-# This fallback token is kept only for local testing.
-# Before GitHub/Render deployment, replace it with a new BotFather token
-# and preferably use the BOT_TOKEN environment variable.
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
     "REPLACE_WITH_NEW_BOT_TOKEN",
@@ -76,9 +76,19 @@ UNLIMITED_PRICE_STARS = 150
 
 TIMEZONE = ZoneInfo("Asia/Dhaka")
 
-DOWNLOAD_DIR = Path("downloads")
-OUTPUT_DIR = Path("converted")
-DATABASE_FILE = Path("bot_data.db")
+# ---------------------------------------------------------------------------
+# Persistent storage root
+# ---------------------------------------------------------------------------
+# On Render, mount a Persistent Disk at /var/data.
+# If DATA_DIR is not set, fall back to the current working directory for
+# local development.
+# ---------------------------------------------------------------------------
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/data"))
+
+DOWNLOAD_DIR = DATA_DIR / "downloads"
+OUTPUT_DIR = DATA_DIR / "converted"
+BACKUP_DIR = DATA_DIR / "backups"
+DATABASE_FILE = DATA_DIR / "bot_data.db"
 
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -91,8 +101,26 @@ SUPPORTED_EXTENSIONS = {".heic", ".heif"}
 # ===========================================================================
 pillow_heif.register_heif_opener()
 
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Make sure every persistent directory exists.
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    # If the persistent disk is not mounted yet, fall back to local paths
+    # so that the bot can still start (useful during local development).
+    fallback = Path.cwd()
+    DATA_DIR = fallback
+    DOWNLOAD_DIR = fallback / "downloads"
+    OUTPUT_DIR = fallback / "converted"
+    BACKUP_DIR = fallback / "backups"
+    DATABASE_FILE = fallback / "bot_data.db"
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -164,7 +192,7 @@ def init_database() -> None:
                 """
             )
 
-            # Migrate databases created by older bot versions.
+            # Migrate older databases
             existing = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(users)").fetchall()
@@ -438,13 +466,6 @@ def record_payment(
     stars: int,
     charge_id: str,
 ) -> bool:
-    """
-    Record a payment once.
-
-    Returns True only when this charge_id was newly recorded.
-    This prevents duplicate webhook/update processing from granting
-    the same package twice.
-    """
     with db_lock:
         conn = get_db()
         try:
@@ -471,9 +492,156 @@ def record_payment(
             conn.close()
 
 
+def record_conversion(
+    user_id: int,
+    filename: str,
+    status: str,
+    quota_source: str | None,
+    file_size: int | None,
+) -> None:
+    created_at = now_bd().isoformat()
+
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO conversions
+                (user_id, filename, status, quota_source, file_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    filename,
+                    status,
+                    quota_source,
+                    file_size,
+                    created_at,
+                ),
+            )
+
+            if status == "success":
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET total_conversions = total_conversions + 1,
+                        successful_conversions = successful_conversions + 1,
+                        last_seen_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (created_at, user_id),
+                )
+            elif status == "failed":
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET total_conversions = total_conversions + 1,
+                        failed_conversions = failed_conversions + 1,
+                        last_seen_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (created_at, user_id),
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # ===========================================================================
-# ADMIN / OWNER
+# BACKUP / RESTORE
+# ===========================================================================
+def create_backup() -> Path:
+    """
+    Create a consistent snapshot of the SQLite database.
+
+    Uses SQLite's own backup API so that WAL mode is handled correctly.
+    Returns the path to the backup file.
+    """
+    timestamp = now_bd().strftime("%Y%m%d_%H%M%S")
+    backup_file = BACKUP_DIR / f"heic_jpg_bot_backup_{timestamp}.db"
+
+    with db_lock:
+        source = sqlite3.connect(DATABASE_FILE)
+        try:
+            destination = sqlite3.connect(backup_file)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+        finally:
+            source.close()
+
+    return backup_file
+
+
+def validate_sqlite_file(path: Path) -> bool:
+    """Return True if the file is a valid SQLite database."""
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            cursor = conn.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()
+            return bool(result) and result[0] == "ok"
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return False
+
+
+def restore_backup(uploaded_file: Path) -> tuple[bool, str]:
+    """
+    Replace the live database with the provided backup file.
+
+    A safety copy of the current database is created first, so a failed
+    restore does not destroy live data.
+
+    Returns (success, message).
+    """
+    if not validate_sqlite_file(uploaded_file):
+        return False, "Uploaded file is not a valid SQLite database."
+
+    timestamp = now_bd().strftime("%Y%m%d_%H%M%S")
+    safety_copy = BACKUP_DIR / f"pre_restore_{timestamp}.db"
+
+    with db_lock:
+        try:
+            # Safety copy of the current database.
+            if DATABASE_FILE.exists():
+                shutil.copy2(DATABASE_FILE, safety_copy)
+
+            # Replace the live database.
+            shutil.copy2(uploaded_file, DATABASE_FILE)
+
+            # Remove any stale WAL/SHM side files from the old DB.
+            for side in (".db-wal", ".db-shm"):
+                stale = DATABASE_FILE.parent / (DATABASE_FILE.name + side.replace(".db", ""))
+                if stale.exists():
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        logger.warning("Could not remove %s", stale, exc_info=True)
+
+        except OSError as exc:
+            logger.exception("Restore failed")
+            return False, f"Filesystem error during restore: {exc}"
+
+    # Re-run initialization / migrations against the restored database.
+    try:
+        init_database()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Post-restore init failed")
+        return False, f"Database restored but re-initialization failed: {exc}"
+
+    return True, (
+        "✅ Database restored successfully.\n\n"
+        f"Safety copy saved as: {safety_copy.name}"
+    )
+
+
+# ===========================================================================
+# ADMIN / OWNER STATISTICS
 # ===========================================================================
 def get_admin_stats() -> dict:
     with db_lock:
@@ -486,7 +654,6 @@ def get_admin_stats() -> dict:
                 "SELECT COUNT(*) AS c FROM users"
             ).fetchone()["c"]
 
-            # Count distinct users with at least one successful conversion today.
             active_today = conn.execute(
                 """
                 SELECT COUNT(DISTINCT user_id) AS c
@@ -571,66 +738,7 @@ def _dt_display(value) -> str:
         return str(value)
 
 
-
-def record_conversion(
-    user_id: int,
-    filename: str,
-    status: str,
-    quota_source: str | None,
-    file_size: int | None,
-) -> None:
-    """Record every conversion attempt and keep user counters in sync."""
-    created_at = now_bd().isoformat()
-
-    with db_lock:
-        conn = get_db()
-        try:
-            conn.execute(
-                """
-                INSERT INTO conversions
-                (user_id, filename, status, quota_source, file_size, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    filename,
-                    status,
-                    quota_source,
-                    file_size,
-                    created_at,
-                ),
-            )
-
-            if status == "success":
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET total_conversions = total_conversions + 1,
-                        successful_conversions = successful_conversions + 1,
-                        last_seen_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (created_at, user_id),
-                )
-            elif status == "failed":
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET total_conversions = total_conversions + 1,
-                        failed_conversions = failed_conversions + 1,
-                        last_seen_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (created_at, user_id),
-                )
-
-            conn.commit()
-        finally:
-            conn.close()
-
-
 def payment_summary(user_id: int) -> dict:
-    """Return payment totals and the most recent payments for one user."""
     with db_lock:
         conn = get_db()
         try:
@@ -666,7 +774,6 @@ def payment_summary(user_id: int) -> dict:
 
 
 def conversion_summary(user_id: int) -> dict:
-    """Return conversion totals and recent activity for one user."""
     with db_lock:
         conn = get_db()
         try:
@@ -708,7 +815,6 @@ def admin_user_text(row: sqlite3.Row) -> str:
     name = row["first_name"] or "(no name)"
     username = row["username"] or "(no username)"
 
-    # Refresh today's free counter if the date changed.
     current = get_user_row(user_id)
     free_used = current["free_used"] if current else row["free_used"]
     paid_credits = current["paid_credits"] if current else row["paid_credits"]
@@ -818,7 +924,6 @@ def admin_all_users_chunks(users: list[sqlite3.Row]) -> list[str]:
         else:
             plan = "🆓 Free"
 
-        # Read live conversion totals from the history table.
         conv = conversion_summary(row["user_id"])
 
         item = (
@@ -851,6 +956,8 @@ async def admin_command(
       /admin              -> dashboard
       /admin users        -> every registered user
       /admin USER_ID      -> complete details for one user
+      /admin backup       -> download live database backup
+      /admin restore      -> restore database from an uploaded .db file
     """
     if not update.message or not update.effective_user:
         return
@@ -863,7 +970,7 @@ async def admin_command(
 
     args = context.args
 
-    # /admin users
+    # ---- /admin users ----------------------------------------------------
     if args and args[0].lower() == "users":
         stats = get_admin_stats()
         chunks = admin_all_users_chunks(stats["users"])
@@ -881,7 +988,55 @@ async def admin_command(
         )
         return
 
-    # /admin USER_ID
+    # ---- /admin backup ---------------------------------------------------
+    if args and args[0].lower() == "backup":
+        try:
+            backup_path = create_backup()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Backup failed")
+            await update.message.reply_text(
+                f"❌ Backup failed: {exc}"
+            )
+            return
+
+        try:
+            with backup_path.open("rb") as backup_file:
+                await update.message.reply_document(
+                    document=backup_file,
+                    filename=backup_path.name,
+                    caption=(
+                        "✅ *Database backup*\n\n"
+                        f"📦 File: `{backup_path.name}`\n"
+                        f"🕐 Time: {_dt_display(now_bd().isoformat())} (BD)\n\n"
+                        "Keep this file safe — you can restore it any time "
+                        "with `/admin restore`."
+                    ),
+                    parse_mode="Markdown",
+                )
+        finally:
+            # Delete the backup from disk after sending — the file lives
+            # on your computer now.
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not delete backup %s", backup_path, exc_info=True)
+        return
+
+    # ---- /admin restore --------------------------------------------------
+    if args and args[0].lower() == "restore":
+        context.user_data["awaiting_restore"] = True
+        await update.message.reply_text(
+            "📥 *Database restore mode*\n\n"
+            "Please send the backup `.db` file as a *document* "
+            "(📎 → File).\n\n"
+            "⚠️ This will replace the current live database.\n"
+            "A safety copy of the current database will be kept automatically.\n\n"
+            "Send /cancel to exit restore mode.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ---- /admin USER_ID --------------------------------------------------
     if args:
         try:
             target_id = int(args[0])
@@ -891,7 +1046,9 @@ async def admin_command(
                 "Use:\n"
                 "/admin\n"
                 "/admin users\n"
-                "/admin USER_ID"
+                "/admin USER_ID\n"
+                "/admin backup\n"
+                "/admin restore"
             )
             return
 
@@ -903,12 +1060,11 @@ async def admin_command(
             return
 
         text = admin_user_text(row)
-        # Telegram text message limit is 4096 chars.
         for i in range(0, len(text), 3800):
             await update.message.reply_text(text[i:i + 3800])
         return
 
-    # /admin dashboard
+    # ---- /admin dashboard ------------------------------------------------
     stats = get_admin_stats()
 
     lines = [
@@ -961,10 +1117,26 @@ async def admin_command(
             "📌 COMMANDS",
             "• /admin users — all registered users",
             "• /admin USER_ID — complete user information",
+            "• /admin backup — download a database backup",
+            "• /admin restore — restore a database backup",
+            "",
+            f"💾 Storage: {DATA_DIR}",
         ]
     )
 
     await update.message.reply_text("\n".join(lines))
+
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Cancel any pending owner action (e.g. restore mode)."""
+    if not update.message or not update.effective_user:
+        return
+
+    context.user_data.pop("awaiting_restore", None)
+    await update.message.reply_text("✅ Cancelled.")
 
 
 # ===========================================================================
@@ -1177,7 +1349,6 @@ async def buy_plan_callback(
     else:
         return
 
-    # Telegram Stars use XTR.
     await context.bot.send_invoice(
         chat_id=query.message.chat_id,
         title=title,
@@ -1230,7 +1401,6 @@ async def successful_payment_handler(
         logger.warning("Unknown payment payload: %s", payload)
         return
 
-    # Never grant the same Telegram payment twice.
     is_new = record_payment(
         user_id=user_id,
         payload=payload,
@@ -1289,14 +1459,22 @@ async def handle_document(
     if not message or not message.document or not user:
         return
 
+    # -----------------------------------------------------------------------
+    # OWNER RESTORE MODE: if owner sent /admin restore and is now uploading a
+    # .db file, treat this document as a database restore.
+    # -----------------------------------------------------------------------
+    if (
+        user.id == OWNER_ID
+        and context.user_data.get("awaiting_restore")
+        and (message.document.file_name or "").lower().endswith(".db")
+    ):
+        await handle_restore_upload(update, context)
+        return
+
     ensure_user(user)
     document = message.document
     filename = document.file_name or "image.heic"
 
-    # -----------------------------------------------------------------------
-    # Check quota BEFORE downloading/converting.
-    # Owner is always allowed.
-    # -----------------------------------------------------------------------
     allowed, source = can_convert(user.id)
 
     if not allowed:
@@ -1309,9 +1487,6 @@ async def handle_document(
         )
         return
 
-    # -----------------------------------------------------------------------
-    # Validate extension
-    # -----------------------------------------------------------------------
     if not is_supported_file(filename):
         await message.reply_text(
             "❌ *Unsupported file type.*\n\n"
@@ -1320,9 +1495,6 @@ async def handle_document(
         )
         return
 
-    # -----------------------------------------------------------------------
-    # Validate file size
-    # -----------------------------------------------------------------------
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply_text(
             f"❌ *File too large.*\n"
@@ -1350,14 +1522,11 @@ async def handle_document(
     conversion_succeeded = False
 
     try:
-        # Download
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(input_file)
 
-        # Convert
         convert_to_jpg(input_file, output_file, quality=JPEG_QUALITY)
 
-        # Send JPG
         with output_file.open("rb") as jpg_file:
             await message.reply_document(
                 document=jpg_file,
@@ -1384,7 +1553,6 @@ async def handle_document(
         )
 
     finally:
-        # IMPORTANT: quota is consumed only after a successful conversion.
         if conversion_succeeded:
             consume_conversion(user.id, source)
             record_conversion(
@@ -1406,6 +1574,55 @@ async def handle_document(
         safe_unlink(input_file)
         safe_unlink(output_file)
 
+        try:
+            await status_message.delete()
+        except Exception:
+            logger.debug("Could not delete status message", exc_info=True)
+
+
+async def handle_restore_upload(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Owner uploaded a .db file while in restore mode."""
+    message = update.message
+    user = update.effective_user
+
+    if not message or not message.document or not user:
+        return
+
+    if user.id != OWNER_ID:
+        return
+
+    document = message.document
+    filename = document.file_name or "backup.db"
+
+    status_message = await message.reply_text(
+        "📥 Downloading backup file for validation..."
+    )
+
+    temp_path = BACKUP_DIR / f"upload_{document.file_unique_id}.db"
+
+    try:
+        telegram_file = await document.get_file()
+        await telegram_file.download_to_drive(temp_path)
+
+        ok, result_message = restore_backup(temp_path)
+
+        # Exit restore mode either way.
+        context.user_data.pop("awaiting_restore", None)
+
+        await message.reply_text(result_message)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Restore upload failed")
+        await message.reply_text(
+            f"❌ Restore failed: {exc}"
+        )
+        context.user_data.pop("awaiting_restore", None)
+
+    finally:
+        safe_unlink(temp_path)
         try:
             await status_message.delete()
         except Exception:
@@ -1441,6 +1658,8 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info(" HEIC → JPG Telegram Bot")
     logger.info(" Owner ID: %s", OWNER_ID)
+    logger.info(" DATA_DIR: %s", DATA_DIR)
+    logger.info(" Database: %s", DATABASE_FILE)
     logger.info(" Free daily limit: %s", FREE_DAILY_LIMIT)
     logger.info(" 20 conversions: %s Stars", PAID_CREDIT_PRICE_STARS)
     logger.info(" 30 days unlimited: %s Stars", UNLIMITED_PRICE_STARS)
@@ -1463,10 +1682,11 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("plans", plans_command))
     application.add_handler(CommandHandler("status", status_command))
 
-    # Telegram Stars payment flow
+    # Payment flow
     application.add_handler(
         CallbackQueryHandler(
             buy_plan_callback,
