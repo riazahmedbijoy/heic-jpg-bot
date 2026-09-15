@@ -1,10 +1,10 @@
 """
-HEIC → JPG Telegram Bot with Turso (persistent cloud database via HTTP)
-========================================================================
+HEIC → JPG Telegram Bot with Turso (persistent, async, concurrent)
+====================================================================
 
 Features:
-- Cloud database on Turso (SQLite-compatible) — survives every deploy
-- Uses HTTP transport (avoids WebSocket issues on Render)
+- Async Turso client (non-blocking) → multiple users served simultaneously
+- Cloud database survives every deploy
 - Owner: unlimited conversions
 - Owner /admin dashboard, /admin users, /admin USER_ID
 - Other users: 5 free successful conversions per Bangladesh day
@@ -15,6 +15,7 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -39,7 +40,7 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# FLASK APP
+# FLASK APP (runs in a separate thread; does not block the asyncio loop)
 # ===========================================================================
 flask_app = Flask(__name__)
 
@@ -52,7 +53,7 @@ def health_check():
 
 def run_flask() -> None:
     port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
 
 # ===========================================================================
@@ -97,22 +98,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-db_lock = threading.Lock()
+# Async lock for multi-statement operations.
+# Global writes still need serialization, but each request no longer blocks
+# the entire event loop the way a threading.Lock() would.
+db_lock: asyncio.Lock | None = None
+
+
+def _get_db_lock() -> asyncio.Lock:
+    """Return the asyncio lock, creating it lazily inside the running loop."""
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
+    return db_lock
 
 
 # ===========================================================================
-# TURSO DATABASE LAYER  (HTTP TRANSPORT — no WebSocket)
+# TURSO DATABASE LAYER — ASYNC
 # ===========================================================================
 _db_client: libsql_client.Client | None = None
 
 
 def _normalize_turso_url(raw_url: str) -> str:
     """
-    Convert a libsql:// URL to an https:// URL so that libsql_client
-    uses HTTP transport instead of WebSocket.
-
-    Render's networking blocks/breaks the WebSocket handshake used by
-    the default libsql:// scheme, so we force HTTP(S) here.
+    Convert a libsql:// URL to https:// so that the libsql client uses
+    HTTP transport instead of WebSocket. Render's networking blocks the
+    WebSocket handshake that the default libsql:// scheme relies on.
     """
     url = raw_url.strip()
 
@@ -123,14 +133,11 @@ def _normalize_turso_url(raw_url: str) -> str:
     elif url.startswith("wss://"):
         url = "https://" + url[len("wss://"):]
 
-    # Strip a trailing slash for consistency.
-    url = url.rstrip("/")
-
-    return url
+    return url.rstrip("/")
 
 
-def get_client() -> libsql_client.Client:
-    """Return a lazily-created Turso client using HTTP transport."""
+async def get_client() -> libsql_client.Client:
+    """Return a lazily-created async Turso client (HTTP transport)."""
     global _db_client
 
     if _db_client is None:
@@ -140,85 +147,80 @@ def get_client() -> libsql_client.Client:
             )
 
         http_url = _normalize_turso_url(TURSO_DATABASE_URL)
-
-        _db_client = libsql_client.create_client_sync(
+        _db_client = libsql_client.create_client(
             url=http_url,
             auth_token=TURSO_AUTH_TOKEN,
         )
-
-        logger.info("Connected to Turso via HTTP: %s", http_url)
+        logger.info("Connected to Turso via async HTTP: %s", http_url)
 
     return _db_client
 
 
-def db_execute(sql: str, params: list | None = None):
+async def db_execute(sql: str, params: list | None = None):
     """Execute a statement and return the raw result."""
-    client = get_client()
-    return client.execute(sql, params or [])
+    client = await get_client()
+    return await client.execute(sql, params or [])
 
 
-def db_fetchone(sql: str, params: list | None = None) -> dict | None:
-    """Return the first row as a dict, or None."""
-    result = db_execute(sql, params)
+async def db_fetchone(sql: str, params: list | None = None) -> dict | None:
+    result = await db_execute(sql, params)
     if not result.rows:
         return None
     return dict(zip(result.columns, result.rows[0]))
 
 
-def db_fetchall(sql: str, params: list | None = None) -> list[dict]:
-    """Return all rows as a list of dicts."""
-    result = db_execute(sql, params)
+async def db_fetchall(sql: str, params: list | None = None) -> list[dict]:
+    result = await db_execute(sql, params)
     return [dict(zip(result.columns, row)) for row in result.rows]
 
 
-def init_database() -> None:
+async def init_database() -> None:
     """Create tables if they don't exist."""
-    with db_lock:
-        db_execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                first_name TEXT,
-                username TEXT,
-                free_date TEXT NOT NULL,
-                free_used INTEGER NOT NULL DEFAULT 0,
-                paid_credits INTEGER NOT NULL DEFAULT 0,
-                unlimited_until TEXT,
-                registered_at TEXT,
-                last_seen_at TEXT,
-                total_conversions INTEGER NOT NULL DEFAULT 0,
-                successful_conversions INTEGER NOT NULL DEFAULT 0,
-                failed_conversions INTEGER NOT NULL DEFAULT 0
-            )
-            """
+    await db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            free_date TEXT NOT NULL,
+            free_used INTEGER NOT NULL DEFAULT 0,
+            paid_credits INTEGER NOT NULL DEFAULT 0,
+            unlimited_until TEXT,
+            registered_at TEXT,
+            last_seen_at TEXT,
+            total_conversions INTEGER NOT NULL DEFAULT 0,
+            successful_conversions INTEGER NOT NULL DEFAULT 0,
+            failed_conversions INTEGER NOT NULL DEFAULT 0
         )
+        """
+    )
 
-        db_execute(
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                stars INTEGER NOT NULL,
-                charge_id TEXT UNIQUE NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
+    await db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            stars INTEGER NOT NULL,
+            charge_id TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
         )
+        """
+    )
 
-        db_execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                filename TEXT,
-                status TEXT NOT NULL,
-                quota_source TEXT,
-                file_size INTEGER,
-                created_at TEXT NOT NULL
-            )
-            """
+    await db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            filename TEXT,
+            status TEXT NOT NULL,
+            quota_source TEXT,
+            file_size INTEGER,
+            created_at TEXT NOT NULL
         )
+        """
+    )
     logger.info("Database schema is ready.")
 
 
@@ -243,67 +245,55 @@ def _dt_display(value) -> str:
 
 
 # ===========================================================================
-# USER MANAGEMENT
+# USER MANAGEMENT (ASYNC)
 # ===========================================================================
-def ensure_user(user) -> dict:
+async def ensure_user(user) -> dict:
     user_id = user.id
     today = today_bd()
     now = now_bd().isoformat()
 
-    with db_lock:
-        row = db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
+    async with _get_db_lock():
+        row = await db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
 
         if row is None:
-            db_execute(
+            await db_execute(
                 """
                 INSERT INTO users
                 (user_id, first_name, username, free_date, free_used,
                  registered_at, last_seen_at)
                 VALUES (?, ?, ?, ?, 0, ?, ?)
                 """,
-                [
-                    user_id,
-                    user.first_name or "",
-                    user.username or "",
-                    today,
-                    now,
-                    now,
-                ],
+                [user_id, user.first_name or "", user.username or "", today, now, now],
             )
         else:
-            db_execute(
+            await db_execute(
                 """
                 UPDATE users
                 SET first_name = ?, username = ?, last_seen_at = ?
                 WHERE user_id = ?
                 """,
-                [
-                    user.first_name or "",
-                    user.username or "",
-                    now,
-                    user_id,
-                ],
+                [user.first_name or "", user.username or "", now, user_id],
             )
 
             if row["free_date"] != today:
-                db_execute(
+                await db_execute(
                     "UPDATE users SET free_date = ?, free_used = 0 WHERE user_id = ?",
                     [today, user_id],
                 )
 
-        return db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
+        return await db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
 
 
-def get_user_row(user_id: int) -> dict | None:
-    with db_lock:
-        row = db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
+async def get_user_row(user_id: int) -> dict | None:
+    async with _get_db_lock():
+        row = await db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
 
         if row and row["free_date"] != today_bd():
-            db_execute(
+            await db_execute(
                 "UPDATE users SET free_date = ?, free_used = 0 WHERE user_id = ?",
                 [today_bd(), user_id],
             )
-            row = db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
+            row = await db_fetchone("SELECT * FROM users WHERE user_id = ?", [user_id])
 
         return row
 
@@ -317,11 +307,11 @@ def unlimited_active(row: dict | None) -> bool:
         return False
 
 
-def entitlement_text(user_id: int) -> str:
+async def entitlement_text(user_id: int) -> str:
     if user_id == OWNER_ID:
         return "👑 Owner: Unlimited"
 
-    row = get_user_row(user_id)
+    row = await get_user_row(user_id)
     if not row:
         return "🆓 Free today: 5"
 
@@ -339,11 +329,11 @@ def entitlement_text(user_id: int) -> str:
     )
 
 
-def can_convert(user_id: int) -> tuple[bool, str]:
+async def can_convert(user_id: int) -> tuple[bool, str]:
     if user_id == OWNER_ID:
         return True, "owner"
 
-    row = get_user_row(user_id)
+    row = await get_user_row(user_id)
     if row is None:
         return True, "free"
     if unlimited_active(row):
@@ -355,33 +345,33 @@ def can_convert(user_id: int) -> tuple[bool, str]:
     return False, "none"
 
 
-def consume_conversion(user_id: int, source: str) -> None:
+async def consume_conversion(user_id: int, source: str) -> None:
     if user_id == OWNER_ID:
         return
-    with db_lock:
+    async with _get_db_lock():
         if source == "free":
-            db_execute(
+            await db_execute(
                 "UPDATE users SET free_used = free_used + 1 WHERE user_id = ?",
                 [user_id],
             )
         elif source == "paid":
-            db_execute(
+            await db_execute(
                 """UPDATE users SET paid_credits = paid_credits - 1
                    WHERE user_id = ? AND paid_credits > 0""",
                 [user_id],
             )
 
 
-def add_paid_credits(user_id: int, amount: int) -> None:
-    with db_lock:
-        db_execute(
+async def add_paid_credits(user_id: int, amount: int) -> None:
+    async with _get_db_lock():
+        await db_execute(
             "UPDATE users SET paid_credits = paid_credits + ? WHERE user_id = ?",
             [amount, user_id],
         )
 
 
-def activate_unlimited(user_id: int) -> None:
-    current = get_user_row(user_id)
+async def activate_unlimited(user_id: int) -> None:
+    current = await get_user_row(user_id)
     current_until = None
     if current and current.get("unlimited_until"):
         try:
@@ -394,17 +384,17 @@ def activate_unlimited(user_id: int) -> None:
         base = current_until
     until = base + timedelta(days=UNLIMITED_DAYS)
 
-    with db_lock:
-        db_execute(
+    async with _get_db_lock():
+        await db_execute(
             "UPDATE users SET unlimited_until = ? WHERE user_id = ?",
             [until.isoformat(), user_id],
         )
 
 
-def record_payment(user_id: int, payload: str, stars: int, charge_id: str) -> bool:
-    with db_lock:
+async def record_payment(user_id: int, payload: str, stars: int, charge_id: str) -> bool:
+    async with _get_db_lock():
         try:
-            db_execute(
+            await db_execute(
                 """INSERT INTO payments
                    (user_id, payload, stars, charge_id, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -416,7 +406,7 @@ def record_payment(user_id: int, payload: str, stars: int, charge_id: str) -> bo
             return False
 
 
-def record_conversion(
+async def record_conversion(
     user_id: int,
     filename: str,
     status: str,
@@ -424,15 +414,15 @@ def record_conversion(
     file_size: int | None,
 ) -> None:
     created_at = now_bd().isoformat()
-    with db_lock:
-        db_execute(
+    async with _get_db_lock():
+        await db_execute(
             """INSERT INTO conversions
                (user_id, filename, status, quota_source, file_size, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             [user_id, filename, status, quota_source, file_size, created_at],
         )
         if status == "success":
-            db_execute(
+            await db_execute(
                 """UPDATE users
                    SET total_conversions = total_conversions + 1,
                        successful_conversions = successful_conversions + 1,
@@ -441,7 +431,7 @@ def record_conversion(
                 [created_at, user_id],
             )
         elif status == "failed":
-            db_execute(
+            await db_execute(
                 """UPDATE users
                    SET total_conversions = total_conversions + 1,
                        failed_conversions = failed_conversions + 1,
@@ -454,105 +444,102 @@ def record_conversion(
 # ===========================================================================
 # ADMIN STATS
 # ===========================================================================
-def get_admin_stats() -> dict:
+async def get_admin_stats() -> dict:
     now = now_bd().isoformat()
     today = today_bd()
-    with db_lock:
-        total_users = db_fetchone("SELECT COUNT(*) AS c FROM users")["c"]
-        active_today = db_fetchone(
-            """SELECT COUNT(DISTINCT user_id) AS c FROM conversions
-               WHERE status = 'success' AND substr(created_at, 1, 10) = ?""",
-            [today],
-        )["c"]
-        total_attempts = db_fetchone("SELECT COUNT(*) AS c FROM conversions")["c"]
-        total_success = db_fetchone(
-            "SELECT COUNT(*) AS c FROM conversions WHERE status = 'success'"
-        )["c"]
-        total_failed = db_fetchone(
-            "SELECT COUNT(*) AS c FROM conversions WHERE status = 'failed'"
-        )["c"]
-        active_unlimited = db_fetchone(
-            """SELECT COUNT(*) AS c FROM users
-               WHERE user_id != ? AND unlimited_until IS NOT NULL
-               AND unlimited_until > ?""",
-            [OWNER_ID, now],
-        )["c"]
-        expired_unlimited = db_fetchone(
-            """SELECT COUNT(*) AS c FROM users
-               WHERE user_id != ? AND unlimited_until IS NOT NULL
-               AND unlimited_until <= ?""",
-            [OWNER_ID, now],
-        )["c"]
-        total_paid_credits = db_fetchone(
-            "SELECT COALESCE(SUM(paid_credits), 0) AS c FROM users"
-        )["c"]
-        payment_count = db_fetchone("SELECT COUNT(*) AS c FROM payments")["c"]
-        total_stars = db_fetchone(
-            "SELECT COALESCE(SUM(stars), 0) AS c FROM payments"
-        )["c"]
-        users = db_fetchall(
-            "SELECT * FROM users ORDER BY last_seen_at DESC"
-        )
-        return {
-            "total_users": total_users,
-            "active_today": active_today,
-            "total_attempts": total_attempts,
-            "total_success": total_success,
-            "total_failed": total_failed,
-            "active_unlimited": active_unlimited,
-            "expired_unlimited": expired_unlimited,
-            "total_paid_credits": total_paid_credits,
-            "payment_count": payment_count,
-            "total_stars": total_stars,
-            "users": users,
-        }
+
+    total_users = (await db_fetchone("SELECT COUNT(*) AS c FROM users"))["c"]
+    active_today = (await db_fetchone(
+        """SELECT COUNT(DISTINCT user_id) AS c FROM conversions
+           WHERE status = 'success' AND substr(created_at, 1, 10) = ?""",
+        [today],
+    ))["c"]
+    total_attempts = (await db_fetchone("SELECT COUNT(*) AS c FROM conversions"))["c"]
+    total_success = (await db_fetchone(
+        "SELECT COUNT(*) AS c FROM conversions WHERE status = 'success'"
+    ))["c"]
+    total_failed = (await db_fetchone(
+        "SELECT COUNT(*) AS c FROM conversions WHERE status = 'failed'"
+    ))["c"]
+    active_unlimited = (await db_fetchone(
+        """SELECT COUNT(*) AS c FROM users
+           WHERE user_id != ? AND unlimited_until IS NOT NULL
+           AND unlimited_until > ?""",
+        [OWNER_ID, now],
+    ))["c"]
+    expired_unlimited = (await db_fetchone(
+        """SELECT COUNT(*) AS c FROM users
+           WHERE user_id != ? AND unlimited_until IS NOT NULL
+           AND unlimited_until <= ?""",
+        [OWNER_ID, now],
+    ))["c"]
+    total_paid_credits = (await db_fetchone(
+        "SELECT COALESCE(SUM(paid_credits), 0) AS c FROM users"
+    ))["c"]
+    payment_count = (await db_fetchone("SELECT COUNT(*) AS c FROM payments"))["c"]
+    total_stars = (await db_fetchone(
+        "SELECT COALESCE(SUM(stars), 0) AS c FROM payments"
+    ))["c"]
+    users = await db_fetchall("SELECT * FROM users ORDER BY last_seen_at DESC")
+
+    return {
+        "total_users": total_users,
+        "active_today": active_today,
+        "total_attempts": total_attempts,
+        "total_success": total_success,
+        "total_failed": total_failed,
+        "active_unlimited": active_unlimited,
+        "expired_unlimited": expired_unlimited,
+        "total_paid_credits": total_paid_credits,
+        "payment_count": payment_count,
+        "total_stars": total_stars,
+        "users": users,
+    }
 
 
-def payment_summary(user_id: int) -> dict:
-    with db_lock:
-        row = db_fetchone(
-            """SELECT COUNT(*) AS count, COALESCE(SUM(stars), 0) AS stars
-               FROM payments WHERE user_id = ?""",
-            [user_id],
-        )
-        payments = db_fetchall(
-            """SELECT payload, stars, charge_id, created_at FROM payments
-               WHERE user_id = ? ORDER BY created_at DESC LIMIT 10""",
-            [user_id],
-        )
-        return {"count": row["count"], "stars": row["stars"], "payments": payments}
+async def payment_summary(user_id: int) -> dict:
+    row = await db_fetchone(
+        """SELECT COUNT(*) AS count, COALESCE(SUM(stars), 0) AS stars
+           FROM payments WHERE user_id = ?""",
+        [user_id],
+    )
+    payments = await db_fetchall(
+        """SELECT payload, stars, charge_id, created_at FROM payments
+           WHERE user_id = ? ORDER BY created_at DESC LIMIT 10""",
+        [user_id],
+    )
+    return {"count": row["count"], "stars": row["stars"], "payments": payments}
 
 
-def conversion_summary(user_id: int) -> dict:
-    with db_lock:
-        row = db_fetchone(
-            """SELECT
-                 COUNT(*) AS total,
-                 COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS successful,
-                 COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS failed
-               FROM conversions WHERE user_id = ?""",
-            [user_id],
-        )
-        recent = db_fetchall(
-            """SELECT filename, status, quota_source, file_size, created_at
-               FROM conversions WHERE user_id = ?
-               ORDER BY created_at DESC LIMIT 20""",
-            [user_id],
-        )
-        return {
-            "total": row["total"],
-            "successful": row["successful"],
-            "failed": row["failed"],
-            "recent": recent,
-        }
+async def conversion_summary(user_id: int) -> dict:
+    row = await db_fetchone(
+        """SELECT
+             COUNT(*) AS total,
+             COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS successful,
+             COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS failed
+           FROM conversions WHERE user_id = ?""",
+        [user_id],
+    )
+    recent = await db_fetchall(
+        """SELECT filename, status, quota_source, file_size, created_at
+           FROM conversions WHERE user_id = ?
+           ORDER BY created_at DESC LIMIT 20""",
+        [user_id],
+    )
+    return {
+        "total": row["total"],
+        "successful": row["successful"],
+        "failed": row["failed"],
+        "recent": recent,
+    }
 
 
-def admin_user_text(row: dict) -> str:
+async def admin_user_text(row: dict) -> str:
     user_id = row["user_id"]
     name = row["first_name"] or "(no name)"
     username = row["username"] or "(no username)"
 
-    current = get_user_row(user_id) or row
+    current = (await get_user_row(user_id)) or row
     free_used = current["free_used"]
     paid_credits = current["paid_credits"]
     unlimited_until = current["unlimited_until"]
@@ -572,8 +559,8 @@ def admin_user_text(row: dict) -> str:
     else:
         plan = "🆓 Free plan"
 
-    payments = payment_summary(user_id)
-    conversions = conversion_summary(user_id)
+    payments = await payment_summary(user_id)
+    conversions = await conversion_summary(user_id)
 
     lines = [
         "🔐 USER ACCOUNT DETAILS",
@@ -633,12 +620,12 @@ def admin_user_text(row: dict) -> str:
     return "\n".join(lines)
 
 
-def admin_all_users_chunks(users: list[dict]) -> list[str]:
+async def admin_all_users_chunks(users: list[dict]) -> list[str]:
     chunks = []
     current = ["👥 ALL REGISTERED USERS", "━━━━━━━━━━━━━━━━━━━━", ""]
 
     for index, row in enumerate(users, start=1):
-        live = get_user_row(row["user_id"]) or row
+        live = (await get_user_row(row["user_id"])) or row
         name = live["first_name"] or "(no name)"
         username = live["username"] or "(no username)"
 
@@ -658,7 +645,7 @@ def admin_all_users_chunks(users: list[dict]) -> list[str]:
         else:
             plan = "🆓 Free"
 
-        conv = conversion_summary(row["user_id"])
+        conv = await conversion_summary(row["user_id"])
         item = (
             f"{index}. {name} | @{username.lstrip('@')}\n"
             f"   🆔 {row['user_id']} | 🆓 {live['free_used']}/{FREE_DAILY_LIMIT} | "
@@ -689,8 +676,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args
 
     if args and args[0].lower() == "users":
-        stats = get_admin_stats()
-        chunks = admin_all_users_chunks(stats["users"])
+        stats = await get_admin_stats()
+        chunks = await admin_all_users_chunks(stats["users"])
         if not chunks:
             await update.message.reply_text("👥 No registered users yet.")
             return
@@ -710,16 +697,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "❌ Use: /admin | /admin users | /admin USER_ID"
             )
             return
-        row = get_user_row(target_id)
+        row = await get_user_row(target_id)
         if row is None:
             await update.message.reply_text(f"🔎 Not found: {target_id}")
             return
-        text = admin_user_text(row)
+        text = await admin_user_text(row)
         for i in range(0, len(text), 3800):
             await update.message.reply_text(text[i:i + 3800])
         return
 
-    stats = get_admin_stats()
+    stats = await get_admin_stats()
     lines = [
         "🔐 ADMIN DASHBOARD",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -745,10 +732,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
 
     for i, row in enumerate(stats["users"][:10], start=1):
-        live = get_user_row(row["user_id"]) or row
+        live = (await get_user_row(row["user_id"])) or row
         name = live["first_name"] or "(no name)"
         username = live["username"] or "(no username)"
-        conv = conversion_summary(row["user_id"])
+        conv = await conversion_summary(row["user_id"])
         lines.append(f"{i}. {name} | @{username.lstrip('@')}")
         lines.append(
             f"   ID: {row['user_id']} | Free: {live['free_used']}/{FREE_DAILY_LIMIT} | "
@@ -760,7 +747,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📌 /admin users — all users",
         "📌 /admin USER_ID — one user details",
         "",
-        "💾 Database: Turso Cloud (persistent, HTTP)",
+        "💾 Database: Turso Cloud (async persistent)",
     ])
 
     await update.message.reply_text("\n".join(lines))
@@ -803,6 +790,12 @@ def plans_text() -> str:
 
 
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
+    """
+    Blocking CPU-bound conversion.
+
+    This runs synchronously, but conversion is fast (typically <1 second),
+    so it does not meaningfully block other users.
+    """
     try:
         with Image.open(input_file) as image:
             image.convert("RGB").save(
@@ -819,7 +812,7 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    ensure_user(update.effective_user)
+    await ensure_user(update.effective_user)
     await update.message.reply_text(
         "👋 Welcome to HEIC → JPG Converter!\n\n"
         "📎 How to use:\n"
@@ -857,7 +850,7 @@ async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    row = ensure_user(update.effective_user)
+    row = await ensure_user(update.effective_user)
 
     if update.effective_user.id == OWNER_ID:
         text = "📊 Status\n\n♾️ Owner: Unlimited."
@@ -928,7 +921,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if not payment:
         return
 
-    ensure_user(update.effective_user)
+    await ensure_user(update.effective_user)
     user_id = update.effective_user.id
     payload = payment.invoice_payload
     charge_id = payment.telegram_payment_charge_id
@@ -941,22 +934,22 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if not stars:
         return
 
-    if not record_payment(user_id, payload, stars, charge_id):
+    if not await record_payment(user_id, payload, stars, charge_id):
         logger.warning("Duplicate payment ignored: %s", charge_id)
         return
 
     if payload == "plan_20":
-        add_paid_credits(user_id, PAID_CREDIT_PACK)
+        await add_paid_credits(user_id, PAID_CREDIT_PACK)
         await update.message.reply_text(
             "🎉 *Payment successful!*\n\n⭐ *20 credits* added.\n\n"
-            + entitlement_text(user_id),
+            + await entitlement_text(user_id),
             parse_mode="Markdown",
         )
     else:
-        activate_unlimited(user_id)
+        await activate_unlimited(user_id)
         await update.message.reply_text(
             "🎉 *Payment successful!*\n\n♾️ *30-day Unlimited* active.\n\n"
-            + entitlement_text(user_id),
+            + await entitlement_text(user_id),
             parse_mode="Markdown",
         )
 
@@ -979,11 +972,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message or not message.document or not user:
         return
 
-    ensure_user(user)
+    await ensure_user(user)
     document = message.document
     filename = document.file_name or "image.heic"
 
-    allowed, source = can_convert(user.id)
+    allowed, source = await can_convert(user.id)
     if not allowed:
         await message.reply_text(
             "🚫 *Free conversions finished for today.*\n\n"
@@ -1021,9 +1014,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     success = False
     try:
+        # Download (async)
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(input_file)
-        convert_to_jpg(input_file, output_file, quality=JPEG_QUALITY)
+
+        # Convert in a worker thread so the event loop stays responsive.
+        await asyncio.to_thread(
+            convert_to_jpg, input_file, output_file, JPEG_QUALITY
+        )
+
         with output_file.open("rb") as jpg_file:
             await message.reply_document(
                 document=jpg_file,
@@ -1041,10 +1040,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("❌ Something went wrong. Try again later.")
     finally:
         if success:
-            consume_conversion(user.id, source)
-            record_conversion(user.id, filename, "success", source, document.file_size)
+            await consume_conversion(user.id, source)
+            await record_conversion(user.id, filename, "success", source, document.file_size)
         else:
-            record_conversion(user.id, filename, "failed", source, document.file_size)
+            await record_conversion(user.id, filename, "failed", source, document.file_size)
         safe_unlink(input_file)
         safe_unlink(output_file)
         try:
@@ -1058,6 +1057,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ===========================================================================
+# POST-INIT (runs after event loop starts)
+# ===========================================================================
+async def on_startup(application: Application) -> None:
+    """Initialize the database once the asyncio loop is running."""
+    await init_database()
+    logger.info("Database initialized.")
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 def main() -> None:
@@ -1068,14 +1076,13 @@ def main() -> None:
             "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set."
         )
 
-    init_database()
-
     logger.info("=" * 60)
-    logger.info(" HEIC → JPG Bot (Turso persistent storage via HTTP)")
+    logger.info(" HEIC → JPG Bot (Turso async persistent)")
     logger.info(" Owner ID: %s", OWNER_ID)
     logger.info(" Turso URL: %s", _normalize_turso_url(TURSO_DATABASE_URL))
     logger.info("=" * 60)
 
+    # Flask runs in its own thread — it must not block the asyncio loop.
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("Flask health-check server started.")
 
@@ -1086,6 +1093,7 @@ def main() -> None:
         .read_timeout(300)
         .write_timeout(300)
         .pool_timeout(60)
+        .post_init(on_startup)
         .build()
     )
 
