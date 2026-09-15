@@ -2,3 +2,4 @@ python-telegram-bot
 pillow
 pillow-heif
 Flask
+libsql-client
