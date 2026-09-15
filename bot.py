@@ -1,9 +1,10 @@
 """
-HEIC → JPG Telegram Bot with Turso (persistent cloud database)
-================================================================
+HEIC → JPG Telegram Bot with Turso (persistent cloud database via HTTP)
+========================================================================
 
 Features:
 - Cloud database on Turso (SQLite-compatible) — survives every deploy
+- Uses HTTP transport (avoids WebSocket issues on Render)
 - Owner: unlimited conversions
 - Owner /admin dashboard, /admin users, /admin USER_ID
 - Other users: 5 free successful conversions per Bangladesh day
@@ -100,24 +101,53 @@ db_lock = threading.Lock()
 
 
 # ===========================================================================
-# TURSO DATABASE LAYER
+# TURSO DATABASE LAYER  (HTTP TRANSPORT — no WebSocket)
 # ===========================================================================
 _db_client: libsql_client.Client | None = None
 
 
+def _normalize_turso_url(raw_url: str) -> str:
+    """
+    Convert a libsql:// URL to an https:// URL so that libsql_client
+    uses HTTP transport instead of WebSocket.
+
+    Render's networking blocks/breaks the WebSocket handshake used by
+    the default libsql:// scheme, so we force HTTP(S) here.
+    """
+    url = raw_url.strip()
+
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+    elif url.startswith("ws://"):
+        url = "http://" + url[len("ws://"):]
+    elif url.startswith("wss://"):
+        url = "https://" + url[len("wss://"):]
+
+    # Strip a trailing slash for consistency.
+    url = url.rstrip("/")
+
+    return url
+
+
 def get_client() -> libsql_client.Client:
-    """Return a lazily-created Turso client."""
+    """Return a lazily-created Turso client using HTTP transport."""
     global _db_client
+
     if _db_client is None:
         if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
             raise RuntimeError(
                 "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set."
             )
+
+        http_url = _normalize_turso_url(TURSO_DATABASE_URL)
+
         _db_client = libsql_client.create_client_sync(
-            url=TURSO_DATABASE_URL,
+            url=http_url,
             auth_token=TURSO_AUTH_TOKEN,
         )
-        logger.info("Connected to Turso database.")
+
+        logger.info("Connected to Turso via HTTP: %s", http_url)
+
     return _db_client
 
 
@@ -730,7 +760,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📌 /admin users — all users",
         "📌 /admin USER_ID — one user details",
         "",
-        "💾 Database: Turso Cloud (persistent)",
+        "💾 Database: Turso Cloud (persistent, HTTP)",
     ])
 
     await update.message.reply_text("\n".join(lines))
@@ -1041,9 +1071,9 @@ def main() -> None:
     init_database()
 
     logger.info("=" * 60)
-    logger.info(" HEIC → JPG Bot (Turso persistent storage)")
+    logger.info(" HEIC → JPG Bot (Turso persistent storage via HTTP)")
     logger.info(" Owner ID: %s", OWNER_ID)
-    logger.info(" Turso URL: %s", TURSO_DATABASE_URL)
+    logger.info(" Turso URL: %s", _normalize_turso_url(TURSO_DATABASE_URL))
     logger.info("=" * 60)
 
     threading.Thread(target=run_flask, daemon=True).start()
