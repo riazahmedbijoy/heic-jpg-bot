@@ -1,12 +1,12 @@
 """
-HEIC → JPG Telegram Bot with Turso (persistent + fully non-blocking)
-=====================================================================
+HEIC → JPG Telegram Bot with Turso (persistent + fully concurrent)
+===================================================================
 
 Key design:
+- concurrent_updates(True) → multiple users served in parallel
 - Every DB call is async (non-blocking HTTP to Turso)
 - File conversion runs in a worker thread (asyncio.to_thread)
-- Non-critical DB writes (last_seen updates, logs) are fire-and-forget
-- Multiple users are served concurrently
+- Non-critical DB writes (last_seen updates) are fire-and-forget
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# FLASK APP (own thread, does not touch the asyncio loop)
+# FLASK APP
 # ===========================================================================
 flask_app = Flask(__name__)
 
@@ -111,7 +111,6 @@ def _normalize_turso_url(raw_url: str) -> str:
 
 
 def get_client() -> libsql_client.Client:
-    """Lazily-created async Turso client (HTTP transport)."""
     global _db_client
     if _db_client is None:
         if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
@@ -210,19 +209,17 @@ def _dt_display(value) -> str:
 
 
 # ===========================================================================
-# FIRE-AND-FORGET HELPER (never blocks the caller)
+# FIRE-AND-FORGET HELPER
 # ===========================================================================
 def spawn(coro) -> None:
-    """Schedule a coroutine on the running loop without awaiting it."""
     try:
         asyncio.create_task(coro)
     except RuntimeError:
-        # No running loop (shouldn't happen inside handlers)
         logger.warning("spawn() called outside event loop")
 
 
 # ===========================================================================
-# USER MANAGEMENT (ASYNC)
+# USER MANAGEMENT
 # ===========================================================================
 async def ensure_user(user) -> dict:
     user_id = user.id
@@ -242,7 +239,6 @@ async def ensure_user(user) -> dict:
             [user_id, user.first_name or "", user.username or "", today, now, now],
         )
     else:
-        # Lightweight update — fire-and-forget so we don't block the user.
         spawn(
             db_execute(
                 """
@@ -372,7 +368,6 @@ async def record_conversion(
     quota_source: str | None,
     file_size: int | None,
 ) -> None:
-    """Record conversion + update counters (all in one background task)."""
     created_at = now_bd().isoformat()
     await db_execute(
         """INSERT INTO conversions
@@ -710,7 +705,6 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    # Fire-and-forget user registration so we can reply instantly.
     spawn(ensure_user(update.effective_user))
     await update.message.reply_text(
         "👋 Welcome to HEIC → JPG Converter!\n\n"
@@ -854,13 +848,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message or not message.document or not user:
         return
 
-    # Registration (non-blocking fire-and-forget)
     spawn(ensure_user(user))
 
     document = message.document
     filename = document.file_name or "image.heic"
 
-    # Quick extension check first (no DB hit)
     if not is_supported_file(filename):
         await message.reply_text(
             "❌ *Unsupported file.* Send a `.HEIC` or `.HEIF`.",
@@ -872,7 +864,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"❌ File too large. Max {MAX_FILE_SIZE_MB} MB.")
         return
 
-    # Quota check (needs DB)
     allowed, source = await can_convert(user.id)
     if not allowed:
         await message.reply_text(
@@ -900,10 +891,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(input_file)
-
-        # Run blocking HEIC conversion in a worker thread.
         await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
-
         with output_file.open("rb") as jpg_file:
             await message.reply_document(
                 document=jpg_file,
@@ -920,7 +908,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("Unexpected error")
         await message.reply_text("❌ Something went wrong. Try again later.")
     finally:
-        # Fire-and-forget: DB writes happen in background.
         if success:
             spawn(consume_conversion(user.id, source))
             spawn(record_conversion(user.id, filename, "success", source, document.file_size))
@@ -956,7 +943,7 @@ def main() -> None:
         raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set.")
 
     logger.info("=" * 60)
-    logger.info(" HEIC → JPG Bot (fully async, non-blocking)")
+    logger.info(" HEIC → JPG Bot (concurrent, non-blocking)")
     logger.info(" Owner ID: %s", OWNER_ID)
     logger.info("=" * 60)
 
@@ -970,6 +957,7 @@ def main() -> None:
         .read_timeout(300)
         .write_timeout(300)
         .pool_timeout(60)
+        .concurrent_updates(True)          # ⬅️ একাধিক ইউজার একসাথে
         .post_init(on_startup)
         .build()
     )
@@ -986,7 +974,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Bot is running.")
+    logger.info("Bot is running with concurrent updates.")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
