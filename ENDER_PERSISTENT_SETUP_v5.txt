@@ -1,0 +1,117 @@
+HEIC -> JPG BOT - RENDER PERSISTENT STORAGE SETUP
+====================================================
+
+WHAT CHANGED
+------------
+The bot now stores:
+- SQLite database
+- downloaded temporary files
+- converted files
+
+under DATA_DIR, default:
+    /var/data
+
+This is designed for a Render Persistent Disk mounted at:
+    /var/data
+
+The bot also includes:
+- /admin backup
+- /admin restore
+- owner-only database backup restore by uploading the backup .db file
+
+IMPORTANT: BACKUP YOUR CURRENT DATA BEFORE CHANGING STORAGE
+------------------------------------------------------------
+Your current Render SQLite database is on Render's ephemeral filesystem.
+Before the storage change, use the CURRENT/LIVE bot and send:
+
+    /admin backup
+
+The bot will send you a file like:
+    heic_jpg_bot_backup_YYYYMMDD_HHMMSS.db
+
+Save that file safely on your computer.
+
+RENDER SETUP
+------------
+1. Open Render Dashboard.
+2. Open your HEIC JPG bot Web Service.
+3. Make sure the service is on a plan that supports Persistent Disk.
+4. Open Disks.
+5. Add a Persistent Disk.
+6. Mount path:
+       /var/data
+7. Choose a small disk size suitable for your bot.
+8. Save.
+
+ENVIRONMENT VARIABLE
+--------------------
+Add this Render environment variable:
+
+    DATA_DIR=/var/data
+
+The code already defaults to /var/data, so this variable is optional,
+but setting it explicitly is recommended.
+
+DEPLOY
+------
+1. Replace your GitHub bot.py with:
+       bot_persistent_v5.py
+
+   Rename it to:
+       bot.py
+
+2. Replace requirements.txt with:
+       requirements_persistent_v5.txt
+
+   Rename it to:
+       requirements.txt
+
+3. Commit and push to GitHub.
+4. Deploy the latest commit on Render.
+5. Wait until the deploy is LIVE.
+6. Check:
+       https://YOUR-RENDER-URL/health
+
+RESTORE YOUR CURRENT USERS/PAYMENTS
+-----------------------------------
+After the new persistent version is LIVE:
+
+1. Open the bot from the OWNER account.
+2. Send:
+       /admin restore
+
+3. Upload the previously saved:
+       heic_jpg_bot_backup_YYYYMMDD_HHMMSS.db
+
+   Send it as File/Document, NOT as Photo.
+
+4. The bot validates the SQLite file.
+5. If valid, it replaces the current empty/new database with your backup.
+6. Then test:
+       /admin
+       /admin users
+       /admin USER_ID
+
+IMPORTANT
+---------
+Do NOT delete your backup until you confirm:
+- registered users are visible
+- free usage counters are correct
+- paid credits are correct
+- unlimited plans are correct
+- payment history is visible
+- conversion history is visible
+
+AFTER THIS CHANGE
+-----------------
+Future deploys will keep the SQLite database because it is stored under
+the Persistent Disk mount path /var/data.
+
+The temporary uploads/conversion files are also placed under /var/data,
+but the bot deletes them after each conversion.
+
+SECURITY
+--------
+Never commit BOT_TOKEN to GitHub.
+Keep BOT_TOKEN in Render Environment Variables.
+If an old token was ever exposed, revoke it in BotFather and use a new one.
