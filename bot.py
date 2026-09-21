@@ -5,6 +5,7 @@ HEIC → JPG Telegram Bot with Turso (persistent + concurrent)
 Features:
 - Concurrent updates (multiple users in parallel)
 - Persistent Turso cloud database
+- Auto webhook cleanup on startup (prevents polling conflicts)
 - Owner: full clickable admin panel
 - 5 free/day for normal users
 - 50 Stars = 20 credits, 150 Stars = 30 days unlimited
@@ -988,12 +989,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("⛔ Owner only.")
         return
 
-    # Clear any pending search state.
     context.user_data.pop("admin_search", None)
-
     args = context.args or []
 
-    # Direct entry: /admin USER_ID
+    # /admin USER_ID
     if args and args[0].isdigit():
         row = await get_user_row(int(args[0]))
         if row is None:
@@ -1007,7 +1006,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # /admin users — quickly jump to the users list
+    # /admin users
     if args and args[0].lower() == "users":
         total = await count_users()
         users = (await get_all_users())[:USERS_PER_PAGE]
@@ -1018,7 +1017,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Default: dashboard
+    # /admin — dashboard
     stats = await get_admin_stats()
     await update.message.reply_text(
         dashboard_text(stats),
@@ -1041,24 +1040,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data or ""
     parts = data.split(":")
 
-    # ---- noop -----------------------------------------------------------
     if data == "adm_noop":
         await query.answer()
         return
 
-    # ---- home / dashboard -----------------------------------------------
     if data == "adm_home":
         context.user_data.pop("admin_search", None)
         await query.answer()
         stats = await get_admin_stats()
-        await _safe_edit(
-            query,
-            dashboard_text(stats),
-            dashboard_keyboard(),
-        )
+        await _safe_edit(query, dashboard_text(stats), dashboard_keyboard())
         return
 
-    # ---- all users (paginated) ------------------------------------------
     if parts[0] == "adm_users":
         await query.answer()
         try:
@@ -1076,7 +1068,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ---- user detail ----------------------------------------------------
     if parts[0] == "adm_user":
         await query.answer()
         try:
@@ -1094,14 +1085,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
         text = await user_detail_text(row)
-        await _safe_edit(
-            query,
-            text,
-            user_detail_keyboard(uid),
-        )
+        await _safe_edit(query, text, user_detail_keyboard(uid))
         return
 
-    # ---- credits menu ---------------------------------------------------
     if parts[0] == "adm_cred_menu":
         await query.answer()
         try:
@@ -1112,14 +1098,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if row is None:
             await query.answer("User not found.", show_alert=True)
             return
-        await _safe_edit(
-            query,
-            credits_menu_text(row),
-            credits_menu_keyboard(uid),
-        )
+        await _safe_edit(query, credits_menu_text(row), credits_menu_keyboard(uid))
         return
 
-    # ---- credit add / remove --------------------------------------------
     if parts[0] in {"adm_cradd", "adm_crrm"}:
         try:
             uid = int(parts[1])
@@ -1137,8 +1118,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             amount = -abs(amount)
 
         await add_paid_credits(uid, amount)
-
-        # Never let balance go below zero for negative adjustments.
         updated = await get_user_row(uid)
         if updated and updated["paid_credits"] < 0:
             await db_execute(
@@ -1150,8 +1129,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer(
             f"✅ {amount:+d} credits applied. New balance: {updated['paid_credits']}"
         )
-
-        # Re-render the credits menu with the new balance.
         await _safe_edit(
             query,
             credits_menu_text(updated),
@@ -1159,7 +1136,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ---- unlimited add / remove -----------------------------------------
     if parts[0] == "adm_unlim_add":
         try:
             uid = int(parts[1])
@@ -1192,7 +1168,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         return
 
-    # ---- user conversions (paginated) -----------------------------------
     if parts[0] == "adm_uconv":
         await query.answer()
         try:
@@ -1213,21 +1188,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ---- user payments --------------------------------------------------
     if parts[0] == "adm_upay":
         await query.answer()
         try:
             uid = int(parts[1])
         except (IndexError, ValueError):
             return
-        await _safe_edit(
-            query,
-            await payments_text(uid),
-            payments_keyboard(uid),
-        )
+        await _safe_edit(query, await payments_text(uid), payments_keyboard(uid))
         return
 
-    # ---- view a specific conversion image -------------------------------
     if parts[0] == "adm_conv":
         try:
             conv_id = int(parts[1])
@@ -1254,7 +1223,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         await query.answer("Sending image...")
-
         caption = (
             f"📄 {conv['filename'] or '(unknown)'}\n"
             f"👤 User ID: {conv['user_id']}\n"
@@ -1276,18 +1244,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text("⚠️ Could not fetch the stored file.")
         return
 
-    # ---- start search ---------------------------------------------------
     if data == "adm_search":
         await query.answer()
         context.user_data["admin_search"] = True
-        await _safe_edit(
-            query,
-            search_prompt_text(),
-            search_prompt_keyboard(),
-        )
+        await _safe_edit(query, search_prompt_text(), search_prompt_keyboard())
         return
 
-    # ---- recent conversions ---------------------------------------------
     if parts[0] == "adm_recent_conv":
         await query.answer()
         try:
@@ -1302,7 +1264,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ---- recent payments ------------------------------------------------
     if parts[0] == "adm_recent_pay":
         await query.answer()
         try:
@@ -1321,7 +1282,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _safe_edit(query, text: str, keyboard: InlineKeyboardMarkup | None) -> None:
-    """Edit current message, falling back to a new message on failure."""
     try:
         await query.edit_message_text(
             text,
@@ -1329,7 +1289,6 @@ async def _safe_edit(query, text: str, keyboard: InlineKeyboardMarkup | None) ->
             reply_markup=keyboard,
         )
     except Exception:
-        # Message might be unchanged or uneditable; send new.
         try:
             await query.message.reply_text(
                 text,
@@ -1571,7 +1530,6 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    # Cancel admin search if active.
     if update.effective_user.id == OWNER_ID:
         context.user_data.pop("admin_search", None)
     await update.message.reply_text(
@@ -1586,7 +1544,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message or not message.document or not user:
         return
 
-    # Owner uploading a document cancels search mode.
     if user.id == OWNER_ID:
         context.user_data.pop("admin_search", None)
 
@@ -1679,9 +1636,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ===========================================================================
-# POST-INIT
+# POST-INIT — runs after the asyncio loop is ready
 # ===========================================================================
 async def on_startup(application: Application) -> None:
+    """Clear any stale webhook and initialize the database."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook cleared (safe for polling).")
+    except Exception:
+        logger.warning("Could not clear webhook.", exc_info=True)
+
     await init_database()
 
 
@@ -1722,7 +1686,7 @@ def main() -> None:
     application.add_handler(CommandHandler("plans", plans_command))
     application.add_handler(CommandHandler("status", status_command))
 
-    # Admin inline callbacks (must be BEFORE buy_ handler)
+    # Admin inline callbacks
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
 
     # Purchase callbacks
@@ -1734,7 +1698,7 @@ def main() -> None:
         MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
     )
 
-    # Admin search text (runs only when admin_search state is active)
+    # Admin search text (only when admin_search state is set)
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
