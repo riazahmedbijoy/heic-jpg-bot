@@ -1,6 +1,6 @@
 """
-HEIC → JPG Telegram Bot with Turso (persistent + concurrent)
-==============================================================
+HEIC / JPG / PNG → JPG Telegram Bot with Turso (persistent + concurrent)
+=========================================================================
 """
 
 from __future__ import annotations
@@ -76,11 +76,22 @@ MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 JPEG_QUALITY = 95
 LOG_LEVEL = logging.INFO
-SUPPORTED_EXTENSIONS = {".heic", ".heif"}
 
-# নতুন: মেমরি বাঁচানোর জন্য সর্বোচ্চ রেজোলিউশন লিমিট (40 Megapixels)
-MAX_PIXELS_LIMIT = 40_000_000
+# সব ইমেজ ফরম্যাট সাপোর্ট করা হচ্ছে
+SUPPORTED_EXTENSIONS = {
+    ".heic", ".heif",           # Apple HEIC/HEIF
+    ".jpg", ".jpeg", ".jpe",    # JPEG
+    ".png",                     # PNG
+    ".webp",                    # WEBP
+    ".bmp",                     # BMP
+    ".tiff", ".tif",            # TIFF
+    ".gif",                     # GIF (first frame)
+}
+
+# বড় ছবি হলে এই সাইজে রিসাইজ করা হবে (মেমরি বাঁচানোর জন্য)
 MAX_DIMENSION = 4096
+# HEIC ডিকোড করার আগে যদি এর চেয়ে বড় হয়, তাহলে ডিকোডের সময়ই ছোট করা হবে
+HEIC_PRE_SCALE_THRESHOLD = 8192
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
@@ -89,17 +100,12 @@ CONVS_PER_PAGE = 8
 # INITIALIZATION
 # ===========================================================================
 pillow_heif.register_heif_opener()
-
-# মেমরি বাঁচানোর জন্য PIL এর ডিফল্ট লিমিট বন্ধ করা হলো (আমরা নিজেরাই চেক করব)
-Image.MAX_IMAGE_PIXELS = None
+Image.MAX_IMAGE_PIXELS = None  # আমরা নিজেরাই রিসাইজ করব
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# একসাথে একাধিক ফাইল কনভার্ট হওয়া রোধ করতে লক
 conversion_lock = asyncio.Lock()
-
-# বর্তমানে কোন ইউজারের কোন টাস্ক চলছে তা ট্র্যাক করার জন্য
 active_tasks: dict[int, asyncio.Task] = {}
 
 logging.basicConfig(
@@ -992,7 +998,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data.pop("admin_search", None)
     args = context.args or []
 
-    # /admin USER_ID
     if args and args[0].isdigit():
         row = await get_user_row(int(args[0]))
         if row is None:
@@ -1006,7 +1011,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # /admin users
     if args and args[0].lower() == "users":
         total = await count_users()
         users = (await get_all_users())[:USERS_PER_PAGE]
@@ -1017,7 +1021,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # /admin — dashboard
     stats = await get_admin_stats()
     await update.message.reply_text(
         dashboard_text(stats),
@@ -1237,7 +1240,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 await query.message.reply_document(
                     document=original_id,
-                    caption="⚠️ Original HEIC file (JPG not stored).\n\n" + caption,
+                    caption="⚠️ Original file (JPG not stored).\n\n" + caption,
                 )
         except Exception:
             logger.exception("Could not send stored file")
@@ -1375,33 +1378,68 @@ def plans_text() -> str:
     )
 
 
+def _load_image_efficiently(input_file: Path) -> Image.Image:
+    """
+    মেমরি বাঁচানোর জন্য HEIC ফাইলকে ডিকোড করার আগেই স্কেল ডাউন করা হয়।
+    অন্যথায় ১০০+ মেগাপিক্সেল ছবি ডিকোড করলে সার্ভার ক্র্যাশ করে।
+    """
+    suffix = input_file.suffix.lower()
+
+    # HEIC/HEIF এর জন্য pillow_heif এর efficient scaling ব্যবহার করা হচ্ছে
+    if suffix in {".heic", ".heif"}:
+        try:
+            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
+            w, h = heif.size
+            if max(w, h) > HEIC_PRE_SCALE_THRESHOLD:
+                factor = HEIC_PRE_SCALE_THRESHOLD / max(w, h)
+                heif = heif.scale(factor)
+            image = Image.frombytes(
+                heif.mode,
+                heif.size,
+                heif.data,
+                "raw",
+                heif.mode,
+                heif.stride,
+            )
+            return image
+        except Exception:
+            logger.debug("pillow_heif direct scaling failed, using PIL open", exc_info=True)
+            return Image.open(input_file)
+
+    # অন্য ফরম্যাটের জন্য সাধারণ PIL
+    return Image.open(input_file)
+
+
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     try:
-        with Image.open(input_file) as image:
-            # মেমরি বাঁচানোর জন্য ছবির সাইজ চেক করা হচ্ছে
-            if image.width * image.height > MAX_PIXELS_LIMIT:
-                raise ConversionError(
-                    f"Image is too large ({image.width}x{image.height} pixels). "
-                    f"Max allowed is {MAX_PIXELS_LIMIT // 1_000_000} Megapixels."
-                )
-            
-            # বড় ছবি হলে রিসাইজ করা হচ্ছে
+        with _load_image_efficiently(input_file) as image:
+            # বড় ছবি হলে রিসাইজ করা হচ্ছে
             if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
                 image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
-            
-            image.convert("RGB").save(
+
+            # অ্যালফা চ্যানেল থাকলে সাদা ব্যাকগ্রাউন্ডে ফ্ল্যাট করা হচ্ছে
+            if image.mode in ("RGBA", "LA", "P"):
+                rgb_image = Image.new("RGB", image.size, (255, 255, 255))
+                rgb_image.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+                image = rgb_image
+            else:
+                image = image.convert("RGB")
+
+            image.save(
                 output_file, format="JPEG", quality=quality, optimize=True,
             )
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         logger.exception("Conversion failed for %s", input_file)
         raise ConversionError(str(exc)) from exc
+    except MemoryError:
+        logger.exception("Out of memory for %s", input_file)
+        raise ConversionError("Image too large for the server. Please try a smaller file.")
 
 
 # ===========================================================================
 # PROGRESS ANIMATION & TASK MANAGEMENT
 # ===========================================================================
 async def animate_status(status_msg, user_id: int, status_info: dict):
-    """প্রসেসিং চলাকালীন স্ট্যাটাস মেসেজে এনিমেশন দেখায়"""
     frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     i = 0
     try:
@@ -1418,19 +1456,18 @@ async def animate_status(status_msg, user_id: int, status_info: dict):
                     ])
                 )
             except Exception:
-                pass  # মেসেজ এডিট এরর ইগনোর করা হচ্ছে
+                pass
             i += 1
     except asyncio.CancelledError:
         pass
 
 
 async def cancel_conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ক্যানসেল বাটন ক্লিক করলে টাস্ক বাতিল করে"""
     query = update.callback_query
     if not query or not query.from_user:
         return
     user_id = query.from_user.id
-    
+
     if user_id in active_tasks:
         task = active_tasks[user_id]
         if not task.done():
@@ -1445,7 +1482,6 @@ async def cancel_conversion_callback(update: Update, context: ContextTypes.DEFAU
 
 
 async def process_conversion(message, user, document, context, source):
-    """ফাইল ডাউনলোড, কনভার্ট এবং আপলোড করার মূল কাজটি করে"""
     filename = document.file_name or "image.heic"
     extension = Path(filename).suffix.lower()
     unique_id = document.file_unique_id
@@ -1453,26 +1489,26 @@ async def process_conversion(message, user, document, context, source):
     output_file = OUTPUT_DIR / f"{unique_id}.jpg"
 
     status_info = {"step": "Downloading...", "file": filename}
-    
+
     status_msg = await message.reply_text(
-        "🔄 HEIC detected...\n⏳ Downloading...",
+        "🔄 File detected...\n⏳ Downloading...",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_conv:{user.id}")]
         ])
     )
-    
+
     animation_task = asyncio.create_task(animate_status(status_msg, user.id, status_info))
-    
+
     success = False
     converted_file_id = None
-    
+
     try:
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(input_file)
-        
+
         status_info["step"] = "Converting..."
         await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
-        
+
         status_info["step"] = "Uploading..."
         with output_file.open("rb") as jpg_file:
             sent = await message.reply_document(
@@ -1483,20 +1519,29 @@ async def process_conversion(message, user, document, context, source):
         if sent.document:
             converted_file_id = sent.document.file_id
         success = True
-        
+
         await status_msg.edit_text("✅ Conversion complete!")
-        
+
     except asyncio.CancelledError:
-        await status_msg.edit_text("❌ Conversion cancelled by user.")
+        try:
+            await status_msg.edit_text("❌ Conversion cancelled by user.")
+        except Exception:
+            pass
         raise
     except ConversionError as e:
-        await status_msg.edit_text(
-            f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another HEIC/HEIF file.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
+        try:
+            await status_msg.edit_text(
+                f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another image file.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    except Exception:
         logger.exception("Unexpected error during conversion")
-        await status_msg.edit_text("❌ *Something went wrong.* Try again later.")
+        try:
+            await status_msg.edit_text("❌ *Something went wrong.* Try again later.")
+        except Exception:
+            pass
     finally:
         animation_task.cancel()
         if success:
@@ -1522,11 +1567,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     spawn(ensure_user(update.effective_user))
     await update.message.reply_text(
-        "👋 Welcome to HEIC → JPG Converter!\n\n"
+        "👋 Welcome to Image → JPG Converter!\n\n"
         "📎 How to use:\n"
         "1️⃣ Tap 📎 Attachment\n"
         "2️⃣ Choose File (not Photo)\n"
-        "3️⃣ Select .HEIC or .HEIF file\n"
+        "3️⃣ Select an image file (HEIC, HEIF, JPG, PNG, WEBP, etc.)\n"
         "4️⃣ Receive your JPG\n\n"
         "🆓 5 free conversions every day.\n\n"
         "📊 /status — check your remaining\n"
@@ -1539,8 +1584,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     await update.message.reply_text(
-        "📸 HEIC → JPG Converter\n\n"
-        "Send your HEIC image as a document (📎 → File).\n\n"
+        "📸 Image → JPG Converter\n\n"
+        "Send your image as a document (📎 → File).\n\n"
+        "Supported: HEIC, HEIF, JPG, PNG, WEBP, BMP, TIFF\n\n"
         "Free: 5 successful conversions/day.\n\n"
         "Commands:\n/start /help /plans /status"
     )
@@ -1588,11 +1634,11 @@ async def buy_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
 
     if query.data == "buy_20":
-        title, desc, payload, stars = ("20 HEIC → JPG Conversions",
+        title, desc, payload, stars = ("20 Image → JPG Conversions",
                                        "20 additional conversions.",
                                        "plan_20", PAID_CREDIT_PRICE_STARS)
     elif query.data == "buy_unlimited":
-        title, desc, payload, stars = ("30 Days Unlimited HEIC → JPG",
+        title, desc, payload, stars = ("30 Days Unlimited Image → JPG",
                                        "Unlimited for 30 days.",
                                        "plan_unlimited_30", UNLIMITED_PRICE_STARS)
     else:
@@ -1661,7 +1707,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_user.id == OWNER_ID:
         context.user_data.pop("admin_search", None)
     await update.message.reply_text(
-        "ℹ️ Send your HEIC as a *document* (📎 → File), not as a photo.",
+        "ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\n"
+        "This preserves the original quality and lets the bot convert it properly.",
         parse_mode="Markdown",
     )
 
@@ -1681,14 +1728,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     filename = document.file_name or "image.heic"
 
     if not is_supported_file(filename):
+        # সমর্থিত ফরম্যাটের তালিকা দেখানো হচ্ছে
+        supported_list = "HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF"
         await message.reply_text(
-            "❌ *Unsupported file.* Send a `.HEIC` or `.HEIF`.",
+            f"❌ *Unsupported file type.*\n\n"
+            f"📎 Please send one of these formats as a document:\n`{supported_list}`",
             parse_mode="Markdown",
         )
         return
 
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
-        await message.reply_text(f"❌ File too large. Max {MAX_FILE_SIZE_MB} MB.")
+        await message.reply_text(
+            f"❌ *File too large.*\nMax allowed: *{MAX_FILE_SIZE_MB} MB*",
+            parse_mode="Markdown",
+        )
         return
 
     allowed, source = await can_convert(user.id)
@@ -1701,17 +1754,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # লক ব্যবহার করে একসাথে একাধিক ফাইল প্রসেস হওয়া রোধ করা হচ্ছে
     async with conversion_lock:
-        # ইউজার যদি অপেক্ষারত অবস্থায় ক্যানসেল করে
         if context.user_data.get("cancel_queued"):
             context.user_data.pop("cancel_queued", None)
             return
 
-        # নতুন টাস্ক তৈরি এবং ট্র্যাকিং
         task = asyncio.create_task(process_conversion(message, user, document, context, source))
         active_tasks[user.id] = task
-        
+
         try:
             await task
         except asyncio.CancelledError:
@@ -1722,18 +1772,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # 409 Conflict এররটি হ্যান্ডেল করা হচ্ছে যাতে লগে ট্রেসব্যাক না আসে
     if isinstance(context.error, telegram.error.Conflict):
-        logger.warning("Conflict detected: Another bot instance is likely running. Waiting for it to shut down...")
+        logger.warning("Conflict detected: Another bot instance is likely running. Waiting...")
         return
     logger.error("Update %s caused error:", update, exc_info=context.error)
 
 
 # ===========================================================================
-# POST-INIT — runs after the asyncio loop is ready
+# POST-INIT
 # ===========================================================================
 async def on_startup(application: Application) -> None:
-    """Clear any stale webhook and initialize the database."""
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook cleared (safe for polling).")
@@ -1753,7 +1801,7 @@ def main() -> None:
         raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set.")
 
     logger.info("=" * 60)
-    logger.info(" HEIC → JPG Bot  ·  Full Admin Panel")
+    logger.info(" Image → JPG Bot  ·  Full Admin Panel")
     logger.info(" Owner ID: %s", OWNER_ID)
     logger.info("=" * 60)
 
@@ -1772,7 +1820,6 @@ def main() -> None:
         .build()
     )
 
-    # Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
@@ -1780,25 +1827,19 @@ def main() -> None:
     application.add_handler(CommandHandler("plans", plans_command))
     application.add_handler(CommandHandler("status", status_command))
 
-    # Admin inline callbacks
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
 
-    # Purchase callbacks
     application.add_handler(
         CallbackQueryHandler(buy_plan_callback, pattern=r"^buy_(20|unlimited)$")
     )
-    
-    # Cancel conversion callback
     application.add_handler(
         CallbackQueryHandler(cancel_conversion_callback, pattern=r"^cancel_conv:")
     )
-    
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(
         MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
     )
 
-    # Admin search text (only when admin_search state is set)
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1806,7 +1847,6 @@ def main() -> None:
         )
     )
 
-    # Image handlers
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_error_handler(error_handler)
