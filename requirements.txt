@@ -3,3 +3,4 @@ pillow
 pillow-heif
 Flask
 libsql-client
+pyvips
