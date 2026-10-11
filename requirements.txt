@@ -1,6 +1,6 @@
-python-telegram-bot
-pillow
-pillow-heif
+python-telegram-bot[rate-limiter]
 Flask
-libsql-client
+Pillow
+pillow-heif
 pyvips
+libsql-client
