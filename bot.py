@@ -9,9 +9,6 @@ import asyncio
 import logging
 import math
 import os
-import shutil
-import subprocess
-import sys
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -86,10 +83,12 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-# সর্বোচ্চ ডাইমেনশন - এর চেয়ে বড় হলে রিসাইজ হবে
+# সর্বোচ্চ পিক্সেল লিমিট (Render Free Tier-এর জন্য নিরাপদ)
+MAX_PIXELS = 30_000_000  # 30 Megapixels
 MAX_DIMENSION = 4096
-# এটি শুধু ফাইনাল সেফটি নেট - যদি সব পদ্ধতি ব্যর্থ হয়
-ABSOLUTE_MAX_PIXELS = 200_000_000  # 200 Megapixels
+
+# HEIC ফাইলের সাইজ যার বেশি হলে আগেই ব্লক করা হবে (কারণ HEIC ভালো কম্প্রেস হয়)
+HEIC_SIZE_WARNING_BYTES = 12 * 1024 * 1024  # 12 MB
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
@@ -112,15 +111,6 @@ logging.basicConfig(
     level=LOG_LEVEL,
 )
 logger = logging.getLogger(__name__)
-
-# Check for pyvips availability
-PYVIPS_AVAILABLE = False
-try:
-    import pyvips  # type: ignore
-    PYVIPS_AVAILABLE = True
-    logger.info("pyvips (libvips) is AVAILABLE - large image support enabled")
-except ImportError:
-    logger.warning("pyvips NOT available - large HEIC files may fail. Install libvips42 + pyvips for best results.")
 
 
 # ===========================================================================
@@ -1355,7 +1345,7 @@ class ConversionError(Exception):
 
 
 class ImageTooLargeError(ConversionError):
-    """Special exception for oversized images."""
+    """Special exception for oversized images - shown differently to user."""
     pass
 
 
@@ -1387,116 +1377,29 @@ def plans_text() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# CONVERSION — Multi-strategy (pyvips → subprocess PIL → in-process PIL)
-# ---------------------------------------------------------------------------
-def _convert_with_pyvips(input_file: Path, output_file: Path, quality: int) -> None:
+def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     """
-    Memory-efficient conversion using libvips.
-    libvips streams the image, using only a few scanlines in memory at any time.
-    This can convert 200+ MP images on 512MB RAM.
+    মেমরি-সাশ্রয়ী কনভার্সন। 
+    পিক্সেল লিমিট চেক করে Oversized হলে ImageTooLargeError রেইজ করে।
     """
-    import pyvips
-
-    # Open with sequential access - streams data instead of loading all at once
-    image = pyvips.Image.new_from_file(str(input_file), access="sequential")
-
-    # Resize if larger than MAX_DIMENSION
-    if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
-        scale = min(MAX_DIMENSION / image.width, MAX_DIMENSION / image.height)
-        image = image.resize(scale)
-
-    # Save as JPEG (streaming write)
-    image.jpegsave(str(output_file), Q=quality)
-
-
-def _convert_with_subprocess_pil(input_file: Path, output_file: Path, quality: int) -> None:
-    """
-    Runs PIL conversion in a subprocess with a memory limit.
-    This way, if the conversion OOMs, the main bot process survives.
-    """
-    script = r'''
-import sys
-import resource
-
-# Set memory limit to 450 MB for the subprocess
-try:
-    resource.setrlimit(resource.RLIMIT_AS, (450 * 1024 * 1024, 450 * 1024 * 1024))
-except (ValueError, OSError):
-    pass
-
-import pillow_heif
-from PIL import Image
-
-pillow_heif.register_heif_opener()
-Image.MAX_IMAGE_PIXELS = None
-
-input_file = sys.argv[1]
-output_file = sys.argv[2]
-quality = int(sys.argv[3])
-max_dim = int(sys.argv[4])
-
-try:
-    with Image.open(input_file) as img:
-        if img.width > max_dim or img.height > max_dim:
-            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-
-        if img.mode in ("RGBA", "LA", "P"):
-            rgb = Image.new("RGB", img.size, (255, 255, 255))
-            if img.mode in ("RGBA", "LA"):
-                rgb.paste(img, mask=img.split()[-1])
-            else:
-                rgb.paste(img)
-            img = rgb
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-
-        img.save(output_file, "JPEG", quality=quality, optimize=True)
-
-    sys.exit(0)
-except MemoryError:
-    sys.stderr.write("OUT_OF_MEMORY\n")
-    sys.exit(3)
-except Exception as e:
-    sys.stderr.write(f"ERROR:{e}\n")
-    sys.exit(1)
-'''
-
-    try:
-        result = subprocess.run(
-            [
-                sys.executable, "-c", script,
-                str(input_file), str(output_file),
-                str(quality), str(MAX_DIMENSION),
-            ],
-            capture_output=True,
-            timeout=180,
-        )
-    except subprocess.TimeoutExpired:
-        raise ConversionError("Conversion timed out. The file may be too complex.")
-
-    if result.returncode == 0:
-        return
-
-    stderr = result.stderr.decode(errors="replace").strip()
-
-    # SIGKILL from OOM killer
-    if result.returncode == -9 or "OUT_OF_MEMORY" in stderr or "MemoryError" in stderr:
-        raise ImageTooLargeError(
-            "This image is too large to process on this server. "
-            "Please reduce its size and try again."
-        )
-
-    raise ConversionError(stderr[:200] if stderr else "Conversion failed.")
-
-
-def _convert_in_process(input_file: Path, output_file: Path, quality: int) -> None:
-    """Standard in-process PIL conversion - for smaller images."""
     try:
         with Image.open(input_file) as image:
-            if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
+            width, height = image.size
+            total_pixels = width * height
+
+            # পিক্সেল লিমিট চেক
+            if total_pixels > MAX_PIXELS:
+                mp = total_pixels / 1_000_000
+                raise ImageTooLargeError(
+                    f"This image has {mp:.1f} megapixels ({width}×{height}). "
+                    f"Server limit is {MAX_PIXELS // 1_000_000} megapixels."
+                )
+
+            # বড় ছবি হলে রিসাইজ
+            if width > MAX_DIMENSION or height > MAX_DIMENSION:
                 image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
+            # RGB কনভার্সন (alpha handling)
             if image.mode in ("RGBA", "LA", "P"):
                 rgb_image = Image.new("RGB", image.size, (255, 255, 255))
                 if image.mode in ("RGBA", "LA"):
@@ -1507,30 +1410,20 @@ def _convert_in_process(input_file: Path, output_file: Path, quality: int) -> No
             elif image.mode != "RGB":
                 image = image.convert("RGB")
 
-            image.save(output_file, format="JPEG", quality=quality, optimize=True)
-    except MemoryError:
-        raise ImageTooLargeError(
-            "This image is too large to process on this server."
-        )
+            image.save(
+                output_file, format="JPEG", quality=quality, optimize=True,
+            )
+    except ImageTooLargeError:
+        raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.exception("Conversion failed for %s", input_file)
         raise ConversionError(str(exc)) from exc
-
-
-def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
-    """
-    Convert any image to JPG with maximum chance of success:
-    1. If pyvips available → use it (best for large images)
-    2. Else → use subprocess PIL with memory limit (bot won't crash)
-    """
-    if PYVIPS_AVAILABLE:
-        try:
-            _convert_with_pyvips(input_file, output_file, quality)
-            return
-        except Exception as e:
-            logger.warning("pyvips conversion failed, falling back to subprocess: %s", e)
-
-    # Fallback: subprocess PIL with memory limit
-    _convert_with_subprocess_pil(input_file, output_file, quality)
+    except MemoryError:
+        logger.exception("Out of memory for %s", input_file)
+        raise ImageTooLargeError(
+            "The image is too large for the server to process. "
+            "Please try a smaller version."
+        )
 
 
 # ===========================================================================
@@ -1617,10 +1510,7 @@ async def process_conversion(message, user, document, context, source):
             converted_file_id = sent.document.file_id
         success = True
 
-        try:
-            await status_msg.edit_text("✅ Conversion complete!")
-        except Exception:
-            pass
+        await status_msg.edit_text("✅ Conversion complete!")
 
     except asyncio.CancelledError:
         try:
@@ -1629,15 +1519,17 @@ async def process_conversion(message, user, document, context, source):
             pass
         raise
     except ImageTooLargeError as e:
+        # বড় ছবির জন্য বিশেষ মেসেজ - ইউজারকে পরিষ্কার নির্দেশনা
         try:
             await status_msg.edit_text(
-                "⚠️ *Could not convert — image too large*\n\n"
-                f"❌ {str(e)}\n\n"
-                "💡 *Try one of these:*\n"
-                "• *iPhone:* Settings → Camera → Formats → *High Efficiency*\n"
-                "• *Reduce resolution:* Use a photo editor to make it smaller\n"
-                "• *Alternative:* Send as JPG or PNG instead\n\n"
-                "✅ *Or:* Send a screenshot of the image — that will work!",
+                "⚠️ *Image Too Large*\n\n"
+                f"❌ Your image is *too high-resolution* for this server to process.\n\n"
+                f"📊 *Details:* {str(e)}\n\n"
+                "💡 *What to do:*\n"
+                "• On iPhone: Settings → Camera → Formats → Choose 'High Efficiency' (not ProRAW/Max)\n"
+                "• Or reduce resolution using a photo editor\n"
+                "• Or send a JPG/PNG version (smaller file)\n\n"
+                f"✅ We can process images up to *{MAX_PIXELS // 1_000_000} megapixels*.",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -1645,8 +1537,7 @@ async def process_conversion(message, user, document, context, source):
     except ConversionError as e:
         try:
             await status_msg.edit_text(
-                f"❌ *Conversion failed.*\nReason: `{str(e)[:200]}`\n\n"
-                "Please try another image file.",
+                f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another image file.",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -1654,9 +1545,7 @@ async def process_conversion(message, user, document, context, source):
     except Exception:
         logger.exception("Unexpected error during conversion")
         try:
-            await status_msg.edit_text(
-                "❌ *Something went wrong.* Please try again later."
-            )
+            await status_msg.edit_text("❌ *Something went wrong.* Try again later.")
         except Exception:
             pass
     finally:
@@ -1704,6 +1593,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📸 Image → JPG Converter\n\n"
         "Send your image as a document (📎 → File).\n\n"
         "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
+        "Max resolution: 30 Megapixels\n"
         "Max file size: 20 MB\n\n"
         "Free: 5 successful conversions/day.\n\n"
         "Commands:\n/start /help /plans /status"
@@ -1826,7 +1716,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("admin_search", None)
     await update.message.reply_text(
         "ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\n"
-        "This preserves original quality so the bot can convert it properly.",
+        "This preserves the original quality and lets the bot convert it properly.",
         parse_mode="Markdown",
     )
 
@@ -1844,6 +1734,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     document = message.document
     filename = document.file_name or "image.heic"
+    suffix = Path(filename).suffix.lower()
 
     if not is_supported_file(filename):
         supported_list = "HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF"
@@ -1857,6 +1748,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply_text(
             f"❌ *File too large.*\nMax allowed: *{MAX_FILE_SIZE_MB} MB*",
+            parse_mode="Markdown",
+        )
+        return
+
+    # HEIC/HEIF এর জন্য আগাম সাইজ চেক (HEIC ভালো কম্প্রেস হয়, তাই সাইজ দেখে বোঝা যায়)
+    if suffix in {".heic", ".heif"} and document.file_size and document.file_size > HEIC_SIZE_WARNING_BYTES:
+        await message.reply_text(
+            "⚠️ *This HEIC file appears to be very high-resolution.*\n\n"
+            f"📦 File size: `{document.file_size / (1024*1024):.1f} MB`\n\n"
+            "This usually means the photo is over 50 megapixels, "
+            "which exceeds our server's memory limit.\n\n"
+            "💡 *Solution:*\n"
+            "• *iPhone:* Settings → Camera → Formats → Choose *'High Efficiency'*\n"
+            "• *Or:* Reduce the resolution using a photo editor\n"
+            "• *Or:* Send a JPG/PNG version of the image\n\n"
+            f"✅ Our limit is *{MAX_PIXELS // 1_000_000} megapixels*.",
             parse_mode="Markdown",
         )
         return
@@ -1920,7 +1827,6 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info(" Image → JPG Bot  ·  Full Admin Panel")
     logger.info(" Owner ID: %s", OWNER_ID)
-    logger.info(" pyvips available: %s", PYVIPS_AVAILABLE)
     logger.info("=" * 60)
 
     threading.Thread(target=run_flask, daemon=True).start()
