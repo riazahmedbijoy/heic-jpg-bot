@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import libsql_client
 import pillow_heif
+import telegram
 from flask import Flask
 from PIL import Image, UnidentifiedImageError
 from telegram import (
@@ -77,7 +78,8 @@ JPEG_QUALITY = 95
 LOG_LEVEL = logging.INFO
 SUPPORTED_EXTENSIONS = {".heic", ".heif"}
 
-# নতুন যোগ করা হয়েছে: বড় ছবি রিসাইজ করার জন্য
+# নতুন: মেমরি বাঁচানোর জন্য সর্বোচ্চ রেজোলিউশন লিমিট (40 Megapixels)
+MAX_PIXELS_LIMIT = 40_000_000
 MAX_DIMENSION = 4096
 
 USERS_PER_PAGE = 8
@@ -88,7 +90,7 @@ CONVS_PER_PAGE = 8
 # ===========================================================================
 pillow_heif.register_heif_opener()
 
-# মেমরি বাঁচানোর জন্য বড় ছবির সতর্কতা বন্ধ করা হলো (আমরা নিজেরাই রিসাইজ করব)
+# মেমরি বাঁচানোর জন্য PIL এর ডিফল্ট লিমিট বন্ধ করা হলো (আমরা নিজেরাই চেক করব)
 Image.MAX_IMAGE_PIXELS = None
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1376,7 +1378,14 @@ def plans_text() -> str:
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     try:
         with Image.open(input_file) as image:
-            # বড় ছবি হলে রিসাইজ করা হচ্ছে যাতে মেমরি শেষ না হয়
+            # মেমরি বাঁচানোর জন্য ছবির সাইজ চেক করা হচ্ছে
+            if image.width * image.height > MAX_PIXELS_LIMIT:
+                raise ConversionError(
+                    f"Image is too large ({image.width}x{image.height} pixels). "
+                    f"Max allowed is {MAX_PIXELS_LIMIT // 1_000_000} Megapixels."
+                )
+            
+            # বড় ছবি হলে রিসাইজ করা হচ্ছে
             if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
                 image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
             
@@ -1713,6 +1722,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # 409 Conflict এররটি হ্যান্ডেল করা হচ্ছে যাতে লগে ট্রেসব্যাক না আসে
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.warning("Conflict detected: Another bot instance is likely running. Waiting for it to shut down...")
+        return
     logger.error("Update %s caused error:", update, exc_info=context.error)
 
 
