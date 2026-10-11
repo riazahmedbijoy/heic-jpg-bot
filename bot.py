@@ -1,6 +1,6 @@
 """
-HEIC / JPG / PNG → JPG Telegram Bot with Turso (persistent + concurrent)
-=========================================================================
+Image → JPG Telegram Bot with Turso (persistent + concurrent)
+==============================================================
 """
 
 from __future__ import annotations
@@ -77,21 +77,18 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 JPEG_QUALITY = 95
 LOG_LEVEL = logging.INFO
 
-# সব ইমেজ ফরম্যাট সাপোর্ট করা হচ্ছে
 SUPPORTED_EXTENSIONS = {
-    ".heic", ".heif",           # Apple HEIC/HEIF
-    ".jpg", ".jpeg", ".jpe",    # JPEG
-    ".png",                     # PNG
-    ".webp",                    # WEBP
-    ".bmp",                     # BMP
-    ".tiff", ".tif",            # TIFF
-    ".gif",                     # GIF (first frame)
+    ".heic", ".heif",
+    ".jpg", ".jpeg", ".jpe",
+    ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-# বড় ছবি হলে এই সাইজে রিসাইজ করা হবে (মেমরি বাঁচানোর জন্য)
+# সর্বোচ্চ পিক্সেল লিমিট (Render Free Tier-এর জন্য নিরাপদ)
+MAX_PIXELS = 30_000_000  # 30 Megapixels
 MAX_DIMENSION = 4096
-# HEIC ডিকোড করার আগে যদি এর চেয়ে বড় হয়, তাহলে ডিকোডের সময়ই ছোট করা হবে
-HEIC_PRE_SCALE_THRESHOLD = 8192
+
+# HEIC ফাইলের সাইজ যার বেশি হলে আগেই ব্লক করা হবে (কারণ HEIC ভালো কম্প্রেস হয়)
+HEIC_SIZE_WARNING_BYTES = 12 * 1024 * 1024  # 12 MB
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
@@ -100,7 +97,7 @@ CONVS_PER_PAGE = 8
 # INITIALIZATION
 # ===========================================================================
 pillow_heif.register_heif_opener()
-Image.MAX_IMAGE_PIXELS = None  # আমরা নিজেরাই রিসাইজ করব
+Image.MAX_IMAGE_PIXELS = None
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -253,9 +250,6 @@ def _dt_short(value) -> str:
         return str(value)
 
 
-# ===========================================================================
-# FIRE-AND-FORGET
-# ===========================================================================
 def spawn(coro) -> None:
     try:
         asyncio.create_task(coro)
@@ -1350,6 +1344,11 @@ class ConversionError(Exception):
     pass
 
 
+class ImageTooLargeError(ConversionError):
+    """Special exception for oversized images - shown differently to user."""
+    pass
+
+
 def is_supported_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in SUPPORTED_EXTENSIONS
 
@@ -1378,62 +1377,53 @@ def plans_text() -> str:
     )
 
 
-def _load_image_efficiently(input_file: Path) -> Image.Image:
-    """
-    মেমরি বাঁচানোর জন্য HEIC ফাইলকে ডিকোড করার আগেই স্কেল ডাউন করা হয়।
-    অন্যথায় ১০০+ মেগাপিক্সেল ছবি ডিকোড করলে সার্ভার ক্র্যাশ করে।
-    """
-    suffix = input_file.suffix.lower()
-
-    # HEIC/HEIF এর জন্য pillow_heif এর efficient scaling ব্যবহার করা হচ্ছে
-    if suffix in {".heic", ".heif"}:
-        try:
-            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            w, h = heif.size
-            if max(w, h) > HEIC_PRE_SCALE_THRESHOLD:
-                factor = HEIC_PRE_SCALE_THRESHOLD / max(w, h)
-                heif = heif.scale(factor)
-            image = Image.frombytes(
-                heif.mode,
-                heif.size,
-                heif.data,
-                "raw",
-                heif.mode,
-                heif.stride,
-            )
-            return image
-        except Exception:
-            logger.debug("pillow_heif direct scaling failed, using PIL open", exc_info=True)
-            return Image.open(input_file)
-
-    # অন্য ফরম্যাটের জন্য সাধারণ PIL
-    return Image.open(input_file)
-
-
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
+    """
+    মেমরি-সাশ্রয়ী কনভার্সন। 
+    পিক্সেল লিমিট চেক করে Oversized হলে ImageTooLargeError রেইজ করে।
+    """
     try:
-        with _load_image_efficiently(input_file) as image:
-            # বড় ছবি হলে রিসাইজ করা হচ্ছে
-            if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
+        with Image.open(input_file) as image:
+            width, height = image.size
+            total_pixels = width * height
+
+            # পিক্সেল লিমিট চেক
+            if total_pixels > MAX_PIXELS:
+                mp = total_pixels / 1_000_000
+                raise ImageTooLargeError(
+                    f"This image has {mp:.1f} megapixels ({width}×{height}). "
+                    f"Server limit is {MAX_PIXELS // 1_000_000} megapixels."
+                )
+
+            # বড় ছবি হলে রিসাইজ
+            if width > MAX_DIMENSION or height > MAX_DIMENSION:
                 image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
-            # অ্যালফা চ্যানেল থাকলে সাদা ব্যাকগ্রাউন্ডে ফ্ল্যাট করা হচ্ছে
+            # RGB কনভার্সন (alpha handling)
             if image.mode in ("RGBA", "LA", "P"):
                 rgb_image = Image.new("RGB", image.size, (255, 255, 255))
-                rgb_image.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+                if image.mode in ("RGBA", "LA"):
+                    rgb_image.paste(image, mask=image.split()[-1])
+                else:
+                    rgb_image.paste(image)
                 image = rgb_image
-            else:
+            elif image.mode != "RGB":
                 image = image.convert("RGB")
 
             image.save(
                 output_file, format="JPEG", quality=quality, optimize=True,
             )
+    except ImageTooLargeError:
+        raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         logger.exception("Conversion failed for %s", input_file)
         raise ConversionError(str(exc)) from exc
     except MemoryError:
         logger.exception("Out of memory for %s", input_file)
-        raise ConversionError("Image too large for the server. Please try a smaller file.")
+        raise ImageTooLargeError(
+            "The image is too large for the server to process. "
+            "Please try a smaller version."
+        )
 
 
 # ===========================================================================
@@ -1528,6 +1518,22 @@ async def process_conversion(message, user, document, context, source):
         except Exception:
             pass
         raise
+    except ImageTooLargeError as e:
+        # বড় ছবির জন্য বিশেষ মেসেজ - ইউজারকে পরিষ্কার নির্দেশনা
+        try:
+            await status_msg.edit_text(
+                "⚠️ *Image Too Large*\n\n"
+                f"❌ Your image is *too high-resolution* for this server to process.\n\n"
+                f"📊 *Details:* {str(e)}\n\n"
+                "💡 *What to do:*\n"
+                "• On iPhone: Settings → Camera → Formats → Choose 'High Efficiency' (not ProRAW/Max)\n"
+                "• Or reduce resolution using a photo editor\n"
+                "• Or send a JPG/PNG version (smaller file)\n\n"
+                f"✅ We can process images up to *{MAX_PIXELS // 1_000_000} megapixels*.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
     except ConversionError as e:
         try:
             await status_msg.edit_text(
@@ -1571,7 +1577,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📎 How to use:\n"
         "1️⃣ Tap 📎 Attachment\n"
         "2️⃣ Choose File (not Photo)\n"
-        "3️⃣ Select an image file (HEIC, HEIF, JPG, PNG, WEBP, etc.)\n"
+        "3️⃣ Select an image (HEIC, JPG, PNG, WEBP, etc.)\n"
         "4️⃣ Receive your JPG\n\n"
         "🆓 5 free conversions every day.\n\n"
         "📊 /status — check your remaining\n"
@@ -1586,7 +1592,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "📸 Image → JPG Converter\n\n"
         "Send your image as a document (📎 → File).\n\n"
-        "Supported: HEIC, HEIF, JPG, PNG, WEBP, BMP, TIFF\n\n"
+        "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
+        "Max resolution: 30 Megapixels\n"
+        "Max file size: 20 MB\n\n"
         "Free: 5 successful conversions/day.\n\n"
         "Commands:\n/start /help /plans /status"
     )
@@ -1726,9 +1734,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     document = message.document
     filename = document.file_name or "image.heic"
+    suffix = Path(filename).suffix.lower()
 
     if not is_supported_file(filename):
-        # সমর্থিত ফরম্যাটের তালিকা দেখানো হচ্ছে
         supported_list = "HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF"
         await message.reply_text(
             f"❌ *Unsupported file type.*\n\n"
@@ -1740,6 +1748,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply_text(
             f"❌ *File too large.*\nMax allowed: *{MAX_FILE_SIZE_MB} MB*",
+            parse_mode="Markdown",
+        )
+        return
+
+    # HEIC/HEIF এর জন্য আগাম সাইজ চেক (HEIC ভালো কম্প্রেস হয়, তাই সাইজ দেখে বোঝা যায়)
+    if suffix in {".heic", ".heif"} and document.file_size and document.file_size > HEIC_SIZE_WARNING_BYTES:
+        await message.reply_text(
+            "⚠️ *This HEIC file appears to be very high-resolution.*\n\n"
+            f"📦 File size: `{document.file_size / (1024*1024):.1f} MB`\n\n"
+            "This usually means the photo is over 50 megapixels, "
+            "which exceeds our server's memory limit.\n\n"
+            "💡 *Solution:*\n"
+            "• *iPhone:* Settings → Camera → Formats → Choose *'High Efficiency'*\n"
+            "• *Or:* Reduce the resolution using a photo editor\n"
+            "• *Or:* Send a JPG/PNG version of the image\n\n"
+            f"✅ Our limit is *{MAX_PIXELS // 1_000_000} megapixels*.",
             parse_mode="Markdown",
         )
         return
@@ -1773,7 +1797,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, telegram.error.Conflict):
-        logger.warning("Conflict detected: Another bot instance is likely running. Waiting...")
+        logger.warning("Conflict detected: Another bot instance is running. Waiting...")
         return
     logger.error("Update %s caused error:", update, exc_info=context.error)
 
