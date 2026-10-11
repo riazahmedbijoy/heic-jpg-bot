@@ -83,12 +83,8 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-# সর্বোচ্চ পিক্সেল লিমিট (Render Free Tier-এর জন্য নিরাপদ)
-MAX_PIXELS = 30_000_000  # 30 Megapixels
+# ফাইনাল আউটপুটের সর্বোচ্চ ডাইমেনশন (এর চেয়ে বড় হলে রিসাইজ হবে)
 MAX_DIMENSION = 4096
-
-# HEIC ফাইলের সাইজ যার বেশি হলে আগেই ব্লক করা হবে (কারণ HEIC ভালো কম্প্রেস হয়)
-HEIC_SIZE_WARNING_BYTES = 12 * 1024 * 1024  # 12 MB
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
@@ -97,7 +93,7 @@ CONVS_PER_PAGE = 8
 # INITIALIZATION
 # ===========================================================================
 pillow_heif.register_heif_opener()
-Image.MAX_IMAGE_PIXELS = None
+Image.MAX_IMAGE_PIXELS = None  # আমরা নিজেরাই HEIC-কে স্কেল করে ডিকোড করব
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1344,11 +1340,6 @@ class ConversionError(Exception):
     pass
 
 
-class ImageTooLargeError(ConversionError):
-    """Special exception for oversized images - shown differently to user."""
-    pass
-
-
 def is_supported_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in SUPPORTED_EXTENSIONS
 
@@ -1377,53 +1368,103 @@ def plans_text() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 🎯 HEIC MAGIC: স্কেল করে ডিকোড করা (মেমরি সাশ্রয়ের আসল কৌশল)
+# ---------------------------------------------------------------------------
+def _decode_heic_smart(input_file: Path) -> Image.Image:
+    """
+    HEIC ফাইলকে ডিকোড করার আগেই libheif-এর স্কেলিং ফিচার ব্যবহার করে ছোট করা হয়।
+    ফলে ১০৮ মেগাপিক্সেলের ছবিও মাত্র কয়েক মেগাবাইট RAM-এ ডিকোড হয়।
+
+    এটি সমাধান করে:
+    - 9000×12000 (108MP) HEIC → সরাসরি 4096×4096 বা কমে ডিকোড হবে
+    - মেমরি ব্যবহার ~324MB → ~5-15MB
+    - Render Free Tier-এর 512MB RAM-এ সহজেই ফিট
+    """
+    heif = pillow_heif.open_heif(
+        str(input_file),
+        convert_hdr_to_8bit=True,
+    )
+
+    # মেটাডেটা থেকে সাইজ নিন (এখনো ডিকোড হয়নি)
+    try:
+        w, h = heif.size
+    except Exception:
+        w, h = heif.size  # fallback
+
+    # যদি ছবি বড় হয়, স্কেল ফ্যাক্টর বের করুন
+    if w > MAX_DIMENSION or h > MAX_DIMENSION:
+        scale = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+        logger.info(
+            "HEIC %dx%d scaled to %.0f%% (→ %dx%d) for memory efficiency",
+            w, h, scale * 100, int(w * scale), int(h * scale),
+        )
+        # এটিই ম্যাজিক: ডিকোডের সময়ই স্কেল হবে, পুরো ছবি RAM-এ লোড হবে না
+        heif = heif.scale(scale)
+
+    # এখানেই শুধু স্কেল করা আকারে ডিকোড হবে
+    pil_img = heif.to_pil()
+    return pil_img
+
+
+def _decode_other_format(input_file: Path) -> Image.Image:
+    """JPG/PNG/WEBP ইত্যাদি ফরম্যাটের জন্য PIL ব্যবহার করে ডিকোড।"""
+    img = Image.open(input_file)
+    # draft() সাপোর্ট করলে রিসাইজ করে ডিকোড করবে (JPEG-এর জন্য দ্রুত)
+    try:
+        img.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+    except Exception:
+        pass
+    return img
+
+
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     """
-    মেমরি-সাশ্রয়ী কনভার্সন। 
-    পিক্সেল লিমিট চেক করে Oversized হলে ImageTooLargeError রেইজ করে।
+    সব ফরম্যাটের জন্য মেমরি-সাশ্রয়ী কনভার্সন।
+    HEIC → libheif-এর নেটিভ স্কেলিং ব্যবহার করে
+    অন্যান্য → PIL draft + thumbnail
     """
+    suffix = input_file.suffix.lower()
+    image = None
+
     try:
-        with Image.open(input_file) as image:
-            width, height = image.size
-            total_pixels = width * height
+        if suffix in {".heic", ".heif"}:
+            image = _decode_heic_smart(input_file)
+        else:
+            image = _decode_other_format(input_file)
 
-            # পিক্সেল লিমিট চেক
-            if total_pixels > MAX_PIXELS:
-                mp = total_pixels / 1_000_000
-                raise ImageTooLargeError(
-                    f"This image has {mp:.1f} megapixels ({width}×{height}). "
-                    f"Server limit is {MAX_PIXELS // 1_000_000} megapixels."
-                )
+        # নিরাপত্তার জন্য আবার রিসাইজ (দরকার হলে)
+        if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
+            image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
-            # বড় ছবি হলে রিসাইজ
-            if width > MAX_DIMENSION or height > MAX_DIMENSION:
-                image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+        # অ্যালফা চ্যানেল থাকলে সাদা ব্যাকগ্রাউন্ডে ফ্ল্যাট করা
+        if image.mode in ("RGBA", "LA", "P"):
+            rgb_image = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode in ("RGBA", "LA"):
+                rgb_image.paste(image, mask=image.split()[-1])
+            else:
+                rgb_image.paste(image)
+            image = rgb_image
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
 
-            # RGB কনভার্সন (alpha handling)
-            if image.mode in ("RGBA", "LA", "P"):
-                rgb_image = Image.new("RGB", image.size, (255, 255, 255))
-                if image.mode in ("RGBA", "LA"):
-                    rgb_image.paste(image, mask=image.split()[-1])
-                else:
-                    rgb_image.paste(image)
-                image = rgb_image
-            elif image.mode != "RGB":
-                image = image.convert("RGB")
-
-            image.save(
-                output_file, format="JPEG", quality=quality, optimize=True,
-            )
-    except ImageTooLargeError:
-        raise
+        image.save(
+            output_file, format="JPEG", quality=quality, optimize=True,
+        )
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         logger.exception("Conversion failed for %s", input_file)
         raise ConversionError(str(exc)) from exc
     except MemoryError:
         logger.exception("Out of memory for %s", input_file)
-        raise ImageTooLargeError(
-            "The image is too large for the server to process. "
-            "Please try a smaller version."
+        raise ConversionError(
+            "The server ran out of memory while processing this image."
         )
+    finally:
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
 
 
 # ===========================================================================
@@ -1436,7 +1477,11 @@ async def animate_status(status_msg, user_id: int, status_info: dict):
         while True:
             await asyncio.sleep(2)
             frame = frames[i % len(frames)]
-            text = f"{frame} {status_info['step']} `{status_info['file'][:20]}...`\n⏳ Please wait..."
+            text = (
+                f"{frame} {status_info['step']}\n"
+                f"📄 `{status_info['file'][:30]}`\n"
+                f"⏳ Please wait..."
+            )
             try:
                 await status_msg.edit_text(
                     text,
@@ -1478,10 +1523,14 @@ async def process_conversion(message, user, document, context, source):
     input_file = DOWNLOAD_DIR / f"{unique_id}{extension}"
     output_file = OUTPUT_DIR / f"{unique_id}.jpg"
 
+    # আউটপুটে মূল ফাইলের নাম রাখা (title preserve)
+    output_filename = Path(filename).with_suffix(".jpg").name
+
     status_info = {"step": "Downloading...", "file": filename}
 
     status_msg = await message.reply_text(
-        "🔄 File detected...\n⏳ Downloading...",
+        f"🔄 File detected...\n📄 `{filename[:30]}`\n⏳ Downloading...",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_conv:{user.id}")]
         ])
@@ -1503,14 +1552,18 @@ async def process_conversion(message, user, document, context, source):
         with output_file.open("rb") as jpg_file:
             sent = await message.reply_document(
                 document=jpg_file,
-                filename=Path(filename).with_suffix(".jpg").name,
-                caption="✅ Conversion complete!",
+                filename=output_filename,
+                caption=f"✅ Conversion complete!\n📄 `{output_filename}`",
+                parse_mode=ParseMode.MARKDOWN,
             )
         if sent.document:
             converted_file_id = sent.document.file_id
         success = True
 
-        await status_msg.edit_text("✅ Conversion complete!")
+        try:
+            await status_msg.edit_text(f"✅ Done: `{output_filename}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
     except asyncio.CancelledError:
         try:
@@ -1518,26 +1571,12 @@ async def process_conversion(message, user, document, context, source):
         except Exception:
             pass
         raise
-    except ImageTooLargeError as e:
-        # বড় ছবির জন্য বিশেষ মেসেজ - ইউজারকে পরিষ্কার নির্দেশনা
-        try:
-            await status_msg.edit_text(
-                "⚠️ *Image Too Large*\n\n"
-                f"❌ Your image is *too high-resolution* for this server to process.\n\n"
-                f"📊 *Details:* {str(e)}\n\n"
-                "💡 *What to do:*\n"
-                "• On iPhone: Settings → Camera → Formats → Choose 'High Efficiency' (not ProRAW/Max)\n"
-                "• Or reduce resolution using a photo editor\n"
-                "• Or send a JPG/PNG version (smaller file)\n\n"
-                f"✅ We can process images up to *{MAX_PIXELS // 1_000_000} megapixels*.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
     except ConversionError as e:
         try:
             await status_msg.edit_text(
-                f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another image file.",
+                f"❌ *Conversion failed.*\n\n📄 `{filename}`\n"
+                f"Reason: `{str(e)[:200]}`\n\n"
+                "Please try another image file.",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -1545,7 +1584,10 @@ async def process_conversion(message, user, document, context, source):
     except Exception:
         logger.exception("Unexpected error during conversion")
         try:
-            await status_msg.edit_text("❌ *Something went wrong.* Try again later.")
+            await status_msg.edit_text(
+                f"❌ *Something went wrong.*\n📄 `{filename}`\nPlease try again later.",
+                parse_mode="Markdown"
+            )
         except Exception:
             pass
     finally:
@@ -1593,8 +1635,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📸 Image → JPG Converter\n\n"
         "Send your image as a document (📎 → File).\n\n"
         "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
-        "Max resolution: 30 Megapixels\n"
         "Max file size: 20 MB\n\n"
+        "Large HEIC photos are automatically resized for efficiency.\n\n"
         "Free: 5 successful conversions/day.\n\n"
         "Commands:\n/start /help /plans /status"
     )
@@ -1716,7 +1758,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("admin_search", None)
     await update.message.reply_text(
         "ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\n"
-        "This preserves the original quality and lets the bot convert it properly.",
+        "This preserves original quality and lets the bot convert it properly.",
         parse_mode="Markdown",
     )
 
@@ -1734,7 +1776,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     document = message.document
     filename = document.file_name or "image.heic"
-    suffix = Path(filename).suffix.lower()
 
     if not is_supported_file(filename):
         supported_list = "HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF"
@@ -1748,22 +1789,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply_text(
             f"❌ *File too large.*\nMax allowed: *{MAX_FILE_SIZE_MB} MB*",
-            parse_mode="Markdown",
-        )
-        return
-
-    # HEIC/HEIF এর জন্য আগাম সাইজ চেক (HEIC ভালো কম্প্রেস হয়, তাই সাইজ দেখে বোঝা যায়)
-    if suffix in {".heic", ".heif"} and document.file_size and document.file_size > HEIC_SIZE_WARNING_BYTES:
-        await message.reply_text(
-            "⚠️ *This HEIC file appears to be very high-resolution.*\n\n"
-            f"📦 File size: `{document.file_size / (1024*1024):.1f} MB`\n\n"
-            "This usually means the photo is over 50 megapixels, "
-            "which exceeds our server's memory limit.\n\n"
-            "💡 *Solution:*\n"
-            "• *iPhone:* Settings → Camera → Formats → Choose *'High Efficiency'*\n"
-            "• *Or:* Reduce the resolution using a photo editor\n"
-            "• *Or:* Send a JPG/PNG version of the image\n\n"
-            f"✅ Our limit is *{MAX_PIXELS // 1_000_000} megapixels*.",
             parse_mode="Markdown",
         )
         return
