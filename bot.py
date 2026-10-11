@@ -1,20 +1,6 @@
 """
 HEIC → JPG Telegram Bot with Turso (persistent + concurrent)
 ==============================================================
-
-Features:
-- Concurrent updates (multiple users in parallel)
-- Persistent Turso cloud database
-- Auto webhook cleanup on startup (prevents polling conflicts)
-- Owner: full clickable admin panel
-- 5 free/day for normal users
-- 50 Stars = 20 credits, 150 Stars = 30 days unlimited
-
-Admin Panel (all clickable):
-  /admin                        open dashboard
-  Dashboard → All Users (paginated) / Search / Recent activity
-  User Detail → Manage Credits / Unlimited / Conversions / Payments
-  Credit Menu → tap preset amounts to add or remove
 """
 
 from __future__ import annotations
@@ -91,6 +77,9 @@ JPEG_QUALITY = 95
 LOG_LEVEL = logging.INFO
 SUPPORTED_EXTENSIONS = {".heic", ".heif"}
 
+# নতুন যোগ করা হয়েছে: বড় ছবি রিসাইজ করার জন্য
+MAX_DIMENSION = 4096
+
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
@@ -99,11 +88,17 @@ CONVS_PER_PAGE = 8
 # ===========================================================================
 pillow_heif.register_heif_opener()
 
+# মেমরি বাঁচানোর জন্য বড় ছবির সতর্কতা বন্ধ করা হলো (আমরা নিজেরাই রিসাইজ করব)
+Image.MAX_IMAGE_PIXELS = None
+
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# নতুন যোগ করা হয়েছে: একসাথে একাধিক ফাইল কনভার্ট হওয়া রোধ করতে লক
+# একসাথে একাধিক ফাইল কনভার্ট হওয়া রোধ করতে লক
 conversion_lock = asyncio.Lock()
+
+# বর্তমানে কোন ইউজারের কোন টাস্ক চলছে তা ট্র্যাক করার জন্য
+active_tasks: dict[int, asyncio.Task] = {}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -1381,12 +1376,133 @@ def plans_text() -> str:
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     try:
         with Image.open(input_file) as image:
+            # বড় ছবি হলে রিসাইজ করা হচ্ছে যাতে মেমরি শেষ না হয়
+            if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
+                image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+            
             image.convert("RGB").save(
                 output_file, format="JPEG", quality=quality, optimize=True,
             )
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         logger.exception("Conversion failed for %s", input_file)
         raise ConversionError(str(exc)) from exc
+
+
+# ===========================================================================
+# PROGRESS ANIMATION & TASK MANAGEMENT
+# ===========================================================================
+async def animate_status(status_msg, user_id: int, status_info: dict):
+    """প্রসেসিং চলাকালীন স্ট্যাটাস মেসেজে এনিমেশন দেখায়"""
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    i = 0
+    try:
+        while True:
+            await asyncio.sleep(2)
+            frame = frames[i % len(frames)]
+            text = f"{frame} {status_info['step']} `{status_info['file'][:20]}...`\n⏳ Please wait..."
+            try:
+                await status_msg.edit_text(
+                    text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_conv:{user_id}")]
+                    ])
+                )
+            except Exception:
+                pass  # মেসেজ এডিট এরর ইগনোর করা হচ্ছে
+            i += 1
+    except asyncio.CancelledError:
+        pass
+
+
+async def cancel_conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ক্যানসেল বাটন ক্লিক করলে টাস্ক বাতিল করে"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    user_id = query.from_user.id
+    
+    if user_id in active_tasks:
+        task = active_tasks[user_id]
+        if not task.done():
+            task.cancel()
+        await query.answer("❌ Conversion cancelled.", show_alert=True)
+        try:
+            await query.edit_message_text("❌ Cancelled by user.")
+        except Exception:
+            pass
+    else:
+        await query.answer("No active conversion to cancel.", show_alert=True)
+
+
+async def process_conversion(message, user, document, context, source):
+    """ফাইল ডাউনলোড, কনভার্ট এবং আপলোড করার মূল কাজটি করে"""
+    filename = document.file_name or "image.heic"
+    extension = Path(filename).suffix.lower()
+    unique_id = document.file_unique_id
+    input_file = DOWNLOAD_DIR / f"{unique_id}{extension}"
+    output_file = OUTPUT_DIR / f"{unique_id}.jpg"
+
+    status_info = {"step": "Downloading...", "file": filename}
+    
+    status_msg = await message.reply_text(
+        "🔄 HEIC detected...\n⏳ Downloading...",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_conv:{user.id}")]
+        ])
+    )
+    
+    animation_task = asyncio.create_task(animate_status(status_msg, user.id, status_info))
+    
+    success = False
+    converted_file_id = None
+    
+    try:
+        telegram_file = await document.get_file()
+        await telegram_file.download_to_drive(input_file)
+        
+        status_info["step"] = "Converting..."
+        await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
+        
+        status_info["step"] = "Uploading..."
+        with output_file.open("rb") as jpg_file:
+            sent = await message.reply_document(
+                document=jpg_file,
+                filename=Path(filename).with_suffix(".jpg").name,
+                caption="✅ Conversion complete!",
+            )
+        if sent.document:
+            converted_file_id = sent.document.file_id
+        success = True
+        
+        await status_msg.edit_text("✅ Conversion complete!")
+        
+    except asyncio.CancelledError:
+        await status_msg.edit_text("❌ Conversion cancelled by user.")
+        raise
+    except ConversionError as e:
+        await status_msg.edit_text(
+            f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another HEIC/HEIF file.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.exception("Unexpected error during conversion")
+        await status_msg.edit_text("❌ *Something went wrong.* Try again later.")
+    finally:
+        animation_task.cancel()
+        if success:
+            spawn(consume_conversion(user.id, source))
+            spawn(record_conversion(
+                user.id, filename, "success", source,
+                document.file_size, converted_file_id, document.file_id,
+            ))
+        else:
+            spawn(record_conversion(
+                user.id, filename, "failed", source,
+                document.file_size, None, document.file_id,
+            ))
+        safe_unlink(input_file)
+        safe_unlink(output_file)
 
 
 # ===========================================================================
@@ -1554,7 +1670,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     document = message.document
     filename = document.file_name or "image.heic"
-    original_file_id = document.file_id
 
     if not is_supported_file(filename):
         await message.reply_text(
@@ -1577,77 +1692,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    extension = Path(filename).suffix.lower()
-    unique_id = document.file_unique_id
-    input_file = DOWNLOAD_DIR / f"{unique_id}{extension}"
-    output_file = OUTPUT_DIR / f"{unique_id}.jpg"
-
-    # =======================================================================
-    # এখানে লক ব্যবহার করা হয়েছে যাতে একসাথে একাধিক ফাইল মেমরি শেষ না করে
-    # =======================================================================
+    # লক ব্যবহার করে একসাথে একাধিক ফাইল প্রসেস হওয়া রোধ করা হচ্ছে
     async with conversion_lock:
-        status_message = await message.reply_text(
-            "🔄 HEIC detected...\n⏳ Downloading and converting..."
-        )
-        try:
-            await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-        except Exception:
-            pass
+        # ইউজার যদি অপেক্ষারত অবস্থায় ক্যানসেল করে
+        if context.user_data.get("cancel_queued"):
+            context.user_data.pop("cancel_queued", None)
+            return
 
-        success = False
-        converted_file_id: str | None = None
-
+        # নতুন টাস্ক তৈরি এবং ট্র্যাকিং
+        task = asyncio.create_task(process_conversion(message, user, document, context, source))
+        active_tasks[user.id] = task
+        
         try:
-            telegram_file = await document.get_file()
-            await telegram_file.download_to_drive(input_file)
-            
-            # কনভার্সন প্রসেসটি থ্রেডে রান করা হচ্ছে
-            await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
-            
-            with output_file.open("rb") as jpg_file:
-                sent = await message.reply_document(
-                    document=jpg_file,
-                    filename=Path(filename).with_suffix(".jpg").name,
-                    caption="✅ Conversion complete!",
-                )
-            if sent.document:
-                converted_file_id = sent.document.file_id
-            success = True
-            
-        except ConversionError as e:
-            # যদি ফাইল নষ্ট থাকে বা কনভার্ট না হয়
-            await status_message.edit_text(
-                f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another HEIC/HEIF file.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.exception("Unexpected error during conversion")
-            await status_message.edit_text(
-                "❌ *Something went wrong.* Try again later.",
-                parse_mode="Markdown"
-            )
+            await task
+        except asyncio.CancelledError:
+            logger.info("Task cancelled for user %s", user.id)
         finally:
-            if success:
-                spawn(consume_conversion(user.id, source))
-                spawn(record_conversion(
-                    user.id, filename, "success", source,
-                    document.file_size, converted_file_id, original_file_id,
-                ))
-                # সফল হলে স্ট্যাটাস মেসেজ ডিলিট করুন
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
-            else:
-                spawn(record_conversion(
-                    user.id, filename, "failed", source,
-                    document.file_size, None, original_file_id,
-                ))
-                # ফেইল করলে স্ট্যাটাস মেসেজটি ডিলিট করবেন না, ইউজার যেন এররটি দেখতে পারে
-            
-            # ফাইল ক্লিনআপ
-            safe_unlink(input_file)
-            safe_unlink(output_file)
+            if user.id in active_tasks and active_tasks[user.id] == task:
+                del active_tasks[user.id]
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1712,6 +1774,12 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(buy_plan_callback, pattern=r"^buy_(20|unlimited)$")
     )
+    
+    # Cancel conversion callback
+    application.add_handler(
+        CallbackQueryHandler(cancel_conversion_callback, pattern=r"^cancel_conv:")
+    )
+    
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(
         MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
