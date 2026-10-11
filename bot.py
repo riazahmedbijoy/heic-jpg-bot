@@ -102,6 +102,9 @@ pillow_heif.register_heif_opener()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# নতুন যোগ করা হয়েছে: একসাথে একাধিক ফাইল কনভার্ট হওয়া রোধ করতে লক
+conversion_lock = asyncio.Lock()
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -1579,56 +1582,72 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     input_file = DOWNLOAD_DIR / f"{unique_id}{extension}"
     output_file = OUTPUT_DIR / f"{unique_id}.jpg"
 
-    status_message = await message.reply_text(
-        "🔄 HEIC detected...\n⏳ Downloading and converting..."
-    )
-    try:
-        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    except Exception:
-        pass
-
-    success = False
-    converted_file_id: str | None = None
-
-    try:
-        telegram_file = await document.get_file()
-        await telegram_file.download_to_drive(input_file)
-        await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
-        with output_file.open("rb") as jpg_file:
-            sent = await message.reply_document(
-                document=jpg_file,
-                filename=Path(filename).with_suffix(".jpg").name,
-                caption="✅ Conversion complete!",
-            )
-        if sent.document:
-            converted_file_id = sent.document.file_id
-        success = True
-    except ConversionError:
-        await message.reply_text(
-            "❌ *Conversion failed.* Try another HEIC/HEIF file.",
-            parse_mode="Markdown",
+    # =======================================================================
+    # এখানে লক ব্যবহার করা হয়েছে যাতে একসাথে একাধিক ফাইল মেমরি শেষ না করে
+    # =======================================================================
+    async with conversion_lock:
+        status_message = await message.reply_text(
+            "🔄 HEIC detected...\n⏳ Downloading and converting..."
         )
-    except Exception:
-        logger.exception("Unexpected error")
-        await message.reply_text("❌ Something went wrong. Try again later.")
-    finally:
-        if success:
-            spawn(consume_conversion(user.id, source))
-            spawn(record_conversion(
-                user.id, filename, "success", source,
-                document.file_size, converted_file_id, original_file_id,
-            ))
-        else:
-            spawn(record_conversion(
-                user.id, filename, "failed", source,
-                document.file_size, None, original_file_id,
-            ))
-        safe_unlink(input_file)
-        safe_unlink(output_file)
         try:
-            await status_message.delete()
+            await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         except Exception:
             pass
+
+        success = False
+        converted_file_id: str | None = None
+
+        try:
+            telegram_file = await document.get_file()
+            await telegram_file.download_to_drive(input_file)
+            
+            # কনভার্সন প্রসেসটি থ্রেডে রান করা হচ্ছে
+            await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
+            
+            with output_file.open("rb") as jpg_file:
+                sent = await message.reply_document(
+                    document=jpg_file,
+                    filename=Path(filename).with_suffix(".jpg").name,
+                    caption="✅ Conversion complete!",
+                )
+            if sent.document:
+                converted_file_id = sent.document.file_id
+            success = True
+            
+        except ConversionError as e:
+            # যদি ফাইল নষ্ট থাকে বা কনভার্ট না হয়
+            await status_message.edit_text(
+                f"❌ *Conversion failed.*\nReason: `{str(e)}`\nTry another HEIC/HEIF file.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.exception("Unexpected error during conversion")
+            await status_message.edit_text(
+                "❌ *Something went wrong.* Try again later.",
+                parse_mode="Markdown"
+            )
+        finally:
+            if success:
+                spawn(consume_conversion(user.id, source))
+                spawn(record_conversion(
+                    user.id, filename, "success", source,
+                    document.file_size, converted_file_id, original_file_id,
+                ))
+                # সফল হলে স্ট্যাটাস মেসেজ ডিলিট করুন
+                try:
+                    await status_message.delete()
+                except Exception:
+                    pass
+            else:
+                spawn(record_conversion(
+                    user.id, filename, "failed", source,
+                    document.file_size, None, original_file_id,
+                ))
+                # ফেইল করলে স্ট্যাটাস মেসেজটি ডিলিট করবেন না, ইউজার যেন এররটি দেখতে পারে
+            
+            # ফাইল ক্লিনআপ
+            safe_unlink(input_file)
+            safe_unlink(output_file)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
