@@ -320,13 +320,11 @@ async def queue_worker(application: Application, worker_id: int):
         try:
             task_id = await conversion_queue.get()
             
-            # Fetch task from DB
             task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ? AND status IN ('pending', 'processing')", [task_id])
             if not task:
                 conversion_queue.task_done()
                 continue
 
-            # Mark as processing
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task_id])
 
             file_id = task["file_id"]
@@ -369,7 +367,6 @@ async def queue_worker(application: Application, worker_id: int):
                 success = True
 
             except telegram.error.RetryAfter as e:
-                # Telegram Flood Control
                 logger.warning(f"Flood control hit. Sleeping for {e.retry_after} seconds.")
                 await asyncio.sleep(e.retry_after)
                 error_msg = "Flood limit"
@@ -381,27 +378,21 @@ async def queue_worker(application: Application, worker_id: int):
 
             # 4. Handle Results
             if success:
-                # Delete from pending tasks
                 await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
-                
-                # Record success in DB
                 spawn(consume_conversion(user_id, source))
                 spawn(record_conversion(user_id, filename, "success", source, file_size, converted_file_id, file_id))
                 logger.info(f"✅ Worker {worker_id} processed: {filename}")
             else:
                 retry_count += 1
                 if retry_count <= MAX_RETRIES:
-                    # Put back in queue (requeue)
                     await db_execute("UPDATE pending_tasks SET retry_count = ?, status = 'pending' WHERE id = ?", [retry_count, task_id])
-                    await asyncio.sleep(2) # Small delay before retry
+                    await asyncio.sleep(2)
                     await conversion_queue.put(task_id)
                     logger.warning(f"⚠️ Worker {worker_id} failed {filename}. Retry {retry_count}/{MAX_RETRIES}.")
                 else:
-                    # Max retries reached
                     await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
                     spawn(record_conversion(user_id, filename, "failed", source, file_size, None, file_id))
                     logger.error(f"❌ Worker {worker_id} permanently failed: {filename}")
-                    
                     try:
                         await bot.send_message(
                             chat_id=chat_id,
@@ -413,9 +404,8 @@ async def queue_worker(application: Application, worker_id: int):
             # 5. Cleanup
             safe_unlink(input_file)
             safe_unlink(output_file)
-            gc.collect() # Force memory cleanup
+            gc.collect() 
             
-            # Small delay to prevent API flooding
             await asyncio.sleep(1)
             conversion_queue.task_done()
 
@@ -486,84 +476,631 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 
 
 # ===========================================================================
+# UI / ADMIN TEXT BUILDERS & KEYBOARDS
+# ===========================================================================
+def plans_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ 20 Conversions — 50 Stars", callback_data="buy_20")],
+        [InlineKeyboardButton("♾️ 30 Days Unlimited — 150 Stars", callback_data="buy_unlimited")],
+    ])
+
+def plans_text() -> str:
+    return (
+        "💰 *Available Plans*\n\n"
+        "🆓 *Free Plan*\n• 5 successful conversions daily\n\n"
+        "⭐ *20 Conversions* — *50 Stars*\n\n"
+        "♾️ *30 Days Unlimited* — *150 Stars*\n\n"
+        "💳 Choose a plan below:"
+    )
+
+def _sep(char: str = "━", n: int = 20) -> str:
+    return char * n
+
+def dashboard_text(stats: dict) -> str:
+    return "\n".join([
+        "🔐  *ADMIN DASHBOARD*", _sep(), "",
+        f"👥 Registered users      :  *{stats['total_users']}*",
+        f"📈 Active today          :  *{stats['active_today']}*", "",
+        "🔄  *CONVERSIONS*",
+        f"   • Total attempts   :  `{stats['total_attempts']}`",
+        f"   • ✅ Successful     :  `{stats['total_success']}`",
+        f"   • ❌ Failed          :  `{stats['total_failed']}`", "",
+        "📦  *PLANS*",
+        f"   • Active unlimited :  `{stats['active_unlimited']}`",
+        f"   • Expired unlimited:  `{stats['expired_unlimited']}`",
+        f"   • Paid credits sum :  `{stats['total_paid_credits']}`", "",
+        "💳  *PAYMENTS*",
+        f"   • Successful       :  `{stats['payment_count']}`",
+        f"   • Total stars      :  `{stats['total_stars']}`", "",
+        _sep("─"), "_Tap a button below to explore_",
+    ])
+
+def dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥  All Users", callback_data="adm_users:0")],
+        [InlineKeyboardButton("🔍  Search User", callback_data="adm_search")],
+        [
+            InlineKeyboardButton("🔄  Recent Conv.", callback_data="adm_recent_conv:0"),
+            InlineKeyboardButton("💳  Recent Pay.", callback_data="adm_recent_pay:0"),
+        ],
+        [InlineKeyboardButton("🔄  Refresh Stats", callback_data="adm_home")],
+    ])
+
+def users_page_text(page: int, total: int) -> str:
+    total_pages = max(1, math.ceil(total / USERS_PER_PAGE))
+    return "\n".join(["👥  *ALL REGISTERED USERS*", _sep(), "", f"📄  Page  *{page + 1}*  /  *{total_pages}*", f"👤  Total  *{total}*  users", "", "_Tap a user to view details_"])
+
+def users_page_keyboard(users: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for row in users:
+        uid = row["user_id"]
+        name = (row["first_name"] or "No name")[:20]
+        total_conv = row["total_conversions"] or 0
+        rows.append([InlineKeyboardButton(f"👤 {name}  ·  {total_conv} conv", callback_data=f"adm_user:{uid}")])
+
+    total_pages = max(1, math.ceil(total / USERS_PER_PAGE))
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"adm_users:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"adm_users:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙  Back to Dashboard", callback_data="adm_home")])
+    return InlineKeyboardMarkup(rows)
+
+async def user_detail_text(row: dict) -> str:
+    uid = row["user_id"]
+    name = row["first_name"] or "(no name)"
+    username = row["username"] or "(none)"
+    free_used = row["free_used"]
+    paid = row["paid_credits"]
+    unlim = row["unlimited_until"]
+
+    if uid == OWNER_ID: plan = "👑  ADMIN / OWNER"
+    elif unlim:
+        try:
+            until = datetime.fromisoformat(unlim)
+            plan = f"♾️  ACTIVE until {_dt_short(unlim)}" if until > now_bd() else f"⏳  EXPIRED at {_dt_short(unlim)}"
+        except (ValueError, TypeError): plan = f"♾️  {unlim}"
+    else: plan = "🆓  Free plan"
+
+    payments = await payment_summary(uid)
+    conversions = await conversion_summary(uid)
+
+    return "\n".join([
+        "🔐  *USER ACCOUNT DETAILS*", _sep(), "",
+        f"👤  Name      :  *{name}*", f"🔗  Username  :  @{username.lstrip('@')}", f"🆔  User ID   :  `{uid}`", "", _sep("─"),
+        "📅  *ACCOUNT*", f"   • Registered :  {_dt_display(row['registered_at'])}", f"   • Last seen  :  {_dt_display(row['last_seen_at'])}", "",
+        "📊  *CURRENT BALANCE*", f"   • Free used today :  `{free_used}/{FREE_DAILY_LIMIT}`", f"   • Free remaining  :  `{max(0, FREE_DAILY_LIMIT - free_used)}`", f"   • Paid credits    :  `{paid}`", "",
+        "📦  *CURRENT PLAN*", f"   • {plan}", "",
+        "🔄  *CONVERSIONS*", f"   • Total       :  `{conversions['total']}`", f"   • ✅ Success  :  `{conversions['successful']}`", f"   • ❌ Failed   :  `{conversions['failed']}`", "",
+        "💳  *PAYMENTS*", f"   • Successful  :  `{payments['count']}`", f"   • Stars paid  :  `{payments['stars']}`",
+    ])
+
+def user_detail_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐  Manage Credits", callback_data=f"adm_cred_menu:{user_id}")],
+        [InlineKeyboardButton("♾️  Add Unlimited", callback_data=f"adm_unlim_add:{user_id}"), InlineKeyboardButton("🚫  Remove", callback_data=f"adm_unlim_rm:{user_id}")],
+        [InlineKeyboardButton("🗂️  Conversions", callback_data=f"adm_uconv:{user_id}:0"), InlineKeyboardButton("💳  Payments", callback_data=f"adm_upay:{user_id}")],
+        [InlineKeyboardButton("🔙  Back to Users", callback_data="adm_users:0")],
+        [InlineKeyboardButton("🏠  Dashboard", callback_data="adm_home")],
+    ])
+
+def credits_menu_text(row: dict) -> str:
+    return "\n".join(["⭐  *MANAGE CREDITS*", _sep(), "", f"👤  User   :  *{row['first_name'] or '(no name)'}*", f"🆔  User ID:  `{row['user_id']}`", f"💰  Current paid credits:  *{row['paid_credits']}*", "", "👇  Tap a button to *ADD* or *REMOVE* credits"])
+
+def credits_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ 5", callback_data=f"adm_cradd:{user_id}:5"), InlineKeyboardButton("➕ 10", callback_data=f"adm_cradd:{user_id}:10"), InlineKeyboardButton("➕ 20", callback_data=f"adm_cradd:{user_id}:20")],
+        [InlineKeyboardButton("➕ 50", callback_data=f"adm_cradd:{user_id}:50"), InlineKeyboardButton("➕ 100", callback_data=f"adm_cradd:{user_id}:100"), InlineKeyboardButton("➕ 200", callback_data=f"adm_cradd:{user_id}:200")],
+        [InlineKeyboardButton("➖ 5", callback_data=f"adm_crrm:{user_id}:5"), InlineKeyboardButton("➖ 10", callback_data=f"adm_crrm:{user_id}:10"), InlineKeyboardButton("➖ 20", callback_data=f"adm_crrm:{user_id}:20")],
+        [InlineKeyboardButton("➖ 50", callback_data=f"adm_crrm:{user_id}:50"), InlineKeyboardButton("➖ 100", callback_data=f"adm_crrm:{user_id}:100"), InlineKeyboardButton("➖ 200", callback_data=f"adm_crrm:{user_id}:200")],
+        [InlineKeyboardButton("🔙  Back to User", callback_data=f"adm_user:{user_id}")],
+    ])
+
+def conversions_page_text(page: int, total: int, user_name: str) -> str:
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    return "\n".join(["🗂️  *CONVERSION HISTORY*", _sep(), "", f"👤  User   :  *{user_name}*", f"📄  Page   :  *{page + 1}* / *{total_pages}*", f"🔄  Total  :  *{total}*", "", "_Tap a conversion to view the image_"])
+
+def conversions_page_keyboard(convs: list[dict], user_id: int, page: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for c in convs:
+        icon = "✅" if c["status"] == "success" else "❌"
+        fname = (c["filename"] or "unknown")[:26]
+        rows.append([InlineKeyboardButton(f"{icon} {fname}", callback_data=f"adm_conv:{c['id']}")])
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"adm_uconv:{user_id}:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"adm_uconv:{user_id}:{page + 1}"))
+    if total_pages > 1: rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙  Back to User", callback_data=f"adm_user:{user_id}")])
+    return InlineKeyboardMarkup(rows)
+
+async def payments_text(user_id: int) -> str:
+    row = await get_user_row(user_id)
+    name = (row["first_name"] or "(no name)") if row else "?"
+    summary = await payment_summary(user_id)
+    lines = ["💳  *PAYMENT HISTORY*", _sep(), "", f"👤  User  :  *{name}*", f"🆔  ID    :  `{user_id}`", "", f"💰  Successful payments  :  *{summary['count']}*", f"⭐  Total Stars paid     :  *{summary['stars']}*", "", _sep("─")]
+    if summary["payments"]:
+        lines.append("📋  *Recent payments*")
+        for p in summary["payments"]:
+            plan_name = {"plan_20": "20 Conversions", "plan_unlimited_30": "30 Days Unlimited"}.get(p["payload"], p["payload"])
+            lines.append(f"   ⭐ {plan_name}  •  {p['stars']}  •  {_dt_short(p['created_at'])}")
+    else: lines.append("_No payments yet_")
+    return "\n".join(lines)
+
+def payments_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙  Back to User", callback_data=f"adm_user:{user_id}")]])
+
+def search_prompt_text() -> str:
+    return "\n".join(["🔍  *SEARCH USER*", _sep(), "", "Send me one of the following:", "   •  *Name*  (partial match)", "   •  *Username*  (without @)", "   •  *Telegram ID*", "", "Type /cancel to abort."])
+
+def search_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌  Cancel", callback_data="adm_home")]])
+
+def search_results_text(query: str, count: int) -> str:
+    return "\n".join(["🔍  *SEARCH RESULTS*", _sep(), "", f"🔎  Query  :  `{query}`", f"📊  Found  :  *{count}*  user(s)", "", "_Tap a user to view details_"])
+
+def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for r in results[:20]:
+        uid = r["user_id"]
+        name = (r["first_name"] or "No name")[:20]
+        total = r["total_conversions"] or 0
+        rows.append([InlineKeyboardButton(f"👤 {name}  ·  {total} conv", callback_data=f"adm_user:{uid}")])
+    rows.append([InlineKeyboardButton("🔍  New Search", callback_data="adm_search")])
+    rows.append([InlineKeyboardButton("🏠  Dashboard", callback_data="adm_home")])
+    return InlineKeyboardMarkup(rows)
+
+def recent_convs_text(page: int, total: int) -> str:
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    return "\n".join(["🔄  *RECENT CONVERSIONS*", _sep(), "", f"📄  Page  :  *{page + 1}* / *{total_pages}*", f"🔄  Total :  *{total}*", "", "_Tap a conversion to view the image_"])
+
+def recent_convs_keyboard(convs: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for c in convs:
+        icon = "✅" if c["status"] == "success" else "❌"
+        fname = (c["filename"] or "unknown")[:22]
+        uid = c["user_id"]
+        rows.append([InlineKeyboardButton(f"{icon} {fname}  ·  {uid}", callback_data=f"adm_conv:{c['id']}")])
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"adm_recent_conv:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"adm_recent_conv:{page + 1}"))
+    if total_pages > 1: rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠  Dashboard", callback_data="adm_home")])
+    return InlineKeyboardMarkup(rows)
+
+def recent_pays_text(page: int, total: int) -> str:
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    return "\n".join(["💳  *RECENT PAYMENTS*", _sep(), "", f"📄  Page  :  *{page + 1}* / *{total_pages}*", f"💰  Total :  *{total}*"])
+
+def recent_pays_keyboard(payments: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for p in payments:
+        plan_name = {"plan_20": "20 credits", "plan_unlimited_30": "30d unlimited"}.get(p["payload"], p["payload"])
+        rows.append([InlineKeyboardButton(f"⭐ {plan_name}  ·  {p['stars']}  ·  {p['user_id']}", callback_data=f"adm_user:{p['user_id']}")])
+    total_pages = max(1, math.ceil(total / CONVS_PER_PAGE))
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"adm_recent_pay:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="adm_noop"))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"adm_recent_pay:{page + 1}"))
+    if total_pages > 1: rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠  Dashboard", callback_data="adm_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ===========================================================================
+# DATABASE FETCHERS FOR ADMIN
+# ===========================================================================
+async def search_users(query: str, limit: int = 30) -> list[dict]:
+    q = query.strip()
+    if not q: return []
+    like = f"%{q}%"
+    return await db_fetchall("SELECT * FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(COALESCE(first_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(username, '')) LIKE LOWER(?) ORDER BY last_seen_at DESC LIMIT ?", [like, like, like, limit])
+
+async def get_all_users() -> list[dict]:
+    return await db_fetchall("SELECT * FROM users ORDER BY last_seen_at DESC")
+
+async def count_users() -> int:
+    row = await db_fetchone("SELECT COUNT(*) AS c FROM users")
+    return row["c"] if row else 0
+
+async def get_admin_stats() -> dict:
+    now = now_bd().isoformat()
+    today = today_bd()
+    total_users = (await db_fetchone("SELECT COUNT(*) AS c FROM users"))["c"]
+    active_today = (await db_fetchone("SELECT COUNT(DISTINCT user_id) AS c FROM conversions WHERE status = 'success' AND substr(created_at, 1, 10) = ?", [today]))["c"]
+    total_attempts = (await db_fetchone("SELECT COUNT(*) AS c FROM conversions"))["c"]
+    total_success = (await db_fetchone("SELECT COUNT(*) AS c FROM conversions WHERE status = 'success'"))["c"]
+    total_failed = (await db_fetchone("SELECT COUNT(*) AS c FROM conversions WHERE status = 'failed'"))["c"]
+    active_unlimited = (await db_fetchone("SELECT COUNT(*) AS c FROM users WHERE user_id != ? AND unlimited_until IS NOT NULL AND unlimited_until > ?", [OWNER_ID, now]))["c"]
+    expired_unlimited = (await db_fetchone("SELECT COUNT(*) AS c FROM users WHERE user_id != ? AND unlimited_until IS NOT NULL AND unlimited_until <= ?", [OWNER_ID, now]))["c"]
+    total_paid_credits = (await db_fetchone("SELECT COALESCE(SUM(paid_credits), 0) AS c FROM users"))["c"]
+    payment_count = (await db_fetchone("SELECT COUNT(*) AS c FROM payments"))["c"]
+    total_stars = (await db_fetchone("SELECT COALESCE(SUM(stars), 0) AS c FROM payments"))["c"]
+    return {
+        "total_users": total_users, "active_today": active_today,
+        "total_attempts": total_attempts, "total_success": total_success, "total_failed": total_failed,
+        "active_unlimited": active_unlimited, "expired_unlimited": expired_unlimited,
+        "total_paid_credits": total_paid_credits, "payment_count": payment_count, "total_stars": total_stars,
+    }
+
+async def payment_summary(user_id: int) -> dict:
+    row = await db_fetchone("SELECT COUNT(*) AS count, COALESCE(SUM(stars), 0) AS stars FROM payments WHERE user_id = ?", [user_id])
+    payments = await db_fetchall("SELECT payload, stars, charge_id, created_at FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", [user_id])
+    return {"count": row["count"], "stars": row["stars"], "payments": payments}
+
+async def conversion_summary(user_id: int) -> dict:
+    row = await db_fetchone("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS successful, COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS failed FROM conversions WHERE user_id = ?", [user_id])
+    recent = await db_fetchall("SELECT id, filename, status, quota_source, file_size, created_at, converted_file_id FROM conversions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20", [user_id])
+    return {"total": row["total"], "successful": row["successful"], "failed": row["failed"], "recent": recent}
+
+async def get_user_conversions_page(user_id: int, page: int, per_page: int):
+    offset = page * per_page
+    rows = await db_fetchall("SELECT id, filename, status, quota_source, file_size, created_at, converted_file_id FROM conversions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", [user_id, per_page, offset])
+    total = await db_fetchone("SELECT COUNT(*) AS c FROM conversions WHERE user_id = ?", [user_id])
+    return rows, (total["c"] if total else 0)
+
+async def get_recent_convs(page: int):
+    rows = await db_fetchall("SELECT id, user_id, filename, status, created_at FROM conversions ORDER BY created_at DESC LIMIT ? OFFSET ?", [CONVS_PER_PAGE, page * CONVS_PER_PAGE])
+    total = await db_fetchone("SELECT COUNT(*) AS c FROM conversions")
+    return rows, (total["c"] if total else 0)
+
+async def get_recent_payments(page: int):
+    rows = await db_fetchall("SELECT id, user_id, payload, stars, charge_id, created_at FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?", [CONVS_PER_PAGE, page * CONVS_PER_PAGE])
+    total = await db_fetchone("SELECT COUNT(*) AS c FROM payments")
+    return rows, (total["c"] if total else 0)
+
+
+# ===========================================================================
+# COMMAND HANDLERS
+# ===========================================================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    spawn(ensure_user(update.effective_user))
+    await update.message.reply_text(
+        "👋 Welcome to Image → JPG Converter!\n\n"
+        "📎 How to use:\n"
+        "1️⃣ Tap 📎 Attachment\n"
+        "2️⃣ Choose File (not Photo)\n"
+        "3️⃣ Select an image (HEIC, JPG, PNG, WEBP, etc.)\n"
+        "4️⃣ Receive your JPG\n\n"
+        "🆓 5 free conversions every day.\n\n"
+        "📊 /status — check your remaining\n"
+        "⭐ /plans — paid plans\n"
+        "❓ /help — help"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    await update.message.reply_text(
+        "📸 Image → JPG Converter\n\n"
+        "Send your image as a document (📎 → File).\n\n"
+        "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
+        "Max file size: 20 MB\n\n"
+        "Large HEIC photos are automatically resized for efficiency.\n\n"
+        "Free: 5 successful conversions/day.\n\n"
+        "Commands:\n/start /help /plans /status"
+    )
+
+async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    await update.message.reply_text(plans_text(), parse_mode="Markdown", reply_markup=plans_keyboard())
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    row = await ensure_user(update.effective_user)
+    if update.effective_user.id == OWNER_ID:
+        text = "📊 Status\n\n♾️ Owner: Unlimited."
+    elif unlimited_active(row):
+        until = datetime.fromisoformat(row["unlimited_until"])
+        text = f"📊 Status\n\n♾️ Unlimited active\n⏰ Until: {until.strftime('%d-%m-%Y %I:%M %p')}"
+    else:
+        free_left = max(0, FREE_DAILY_LIMIT - row["free_used"])
+        text = (f"📊 Status\n\n🆓 Free left today: {free_left}/{FREE_DAILY_LIMIT}\n"
+                f"⭐ Paid credits: {row['paid_credits']}\n\n💰 /plans")
+    await update.message.reply_text(text)
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    context.user_data.pop("admin_search", None)
+    await update.message.reply_text("✅ Cancelled.")
+
+
+# ===========================================================================
+# ADMIN COMMAND & CALLBACKS
+# ===========================================================================
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    context.user_data.pop("admin_search", None)
+    args = context.args or []
+    if args and args[0].isdigit():
+        row = await get_user_row(int(args[0]))
+        if row is None:
+            await update.message.reply_text(f"🔎 No user with ID {args[0]}.")
+            return
+        text = await user_detail_text(row)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=user_detail_keyboard(row["user_id"]))
+        return
+    if args and args[0].lower() == "users":
+        total = await count_users()
+        users = (await get_all_users())[:USERS_PER_PAGE]
+        await update.message.reply_text(users_page_text(0, total), parse_mode=ParseMode.MARKDOWN, reply_markup=users_page_keyboard(users, 0, total))
+        return
+    stats = await get_admin_stats()
+    await update.message.reply_text(dashboard_text(stats), parse_mode=ParseMode.MARKDOWN, reply_markup=dashboard_keyboard())
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ Owner only.", show_alert=True)
+        return
+    data = query.data or ""
+    parts = data.split(":")
+
+    if data == "adm_noop": await query.answer(); return
+    if data == "adm_home":
+        context.user_data.pop("admin_search", None)
+        await query.answer()
+        stats = await get_admin_stats()
+        await _safe_edit(query, dashboard_text(stats), dashboard_keyboard())
+        return
+    if parts[0] == "adm_users":
+        await query.answer()
+        try: page = int(parts[1])
+        except: page = 0
+        users_all = await get_all_users()
+        total = len(users_all)
+        chunk = users_all[page * USERS_PER_PAGE:(page + 1) * USERS_PER_PAGE]
+        await _safe_edit(query, users_page_text(page, total), users_page_keyboard(chunk, page, total))
+        return
+    if parts[0] == "adm_user":
+        await query.answer()
+        try: uid = int(parts[1])
+        except: return
+        row = await get_user_row(uid)
+        if row is None:
+            await _safe_edit(query, "🔎 User not found.", InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Dashboard", callback_data="adm_home")]]))
+            return
+        await _safe_edit(query, await user_detail_text(row), user_detail_keyboard(uid))
+        return
+    if parts[0] == "adm_cred_menu":
+        await query.answer()
+        try: uid = int(parts[1])
+        except: return
+        row = await get_user_row(uid)
+        if row is None: await query.answer("User not found.", show_alert=True); return
+        await _safe_edit(query, credits_menu_text(row), credits_menu_keyboard(uid))
+        return
+    if parts[0] in {"adm_cradd", "adm_crrm"}:
+        try: uid = int(parts[1]); amount = int(parts[2])
+        except: await query.answer("Invalid."); return
+        row = await get_user_row(uid)
+        if row is None: await query.answer("User not found.", show_alert=True); return
+        if parts[0] == "adm_crrm": amount = -abs(amount)
+        await add_paid_credits(uid, amount)
+        updated = await get_user_row(uid)
+        if updated and updated["paid_credits"] < 0:
+            await db_execute("UPDATE users SET paid_credits = 0 WHERE user_id = ?", [uid])
+            updated = await get_user_row(uid)
+        await query.answer(f"✅ {amount:+d} credits applied. New balance: {updated['paid_credits']}")
+        await _safe_edit(query, credits_menu_text(updated), credits_menu_keyboard(uid))
+        return
+    if parts[0] == "adm_unlim_add":
+        try: uid = int(parts[1])
+        except: return
+        await add_unlimited_days(uid, UNLIMITED_DAYS)
+        await query.answer(f"✅ Unlimited added (+{UNLIMITED_DAYS} days).")
+        row = await get_user_row(uid)
+        if row: await _safe_edit(query, await user_detail_text(row), user_detail_keyboard(uid))
+        return
+    if parts[0] == "adm_unlim_rm":
+        try: uid = int(parts[1])
+        except: return
+        await remove_unlimited(uid)
+        await query.answer("✅ Unlimited removed.")
+        row = await get_user_row(uid)
+        if row: await _safe_edit(query, await user_detail_text(row), user_detail_keyboard(uid))
+        return
+    if parts[0] == "adm_uconv":
+        await query.answer()
+        try: uid = int(parts[1]); page = int(parts[2])
+        except: return
+        row = await get_user_row(uid)
+        if row is None: await query.answer("User not found.", show_alert=True); return
+        convs, total = await get_user_conversions_page(uid, page, CONVS_PER_PAGE)
+        await _safe_edit(query, conversions_page_text(page, total, row["first_name"] or "(no name)"), conversions_page_keyboard(convs, uid, page, total))
+        return
+    if parts[0] == "adm_upay":
+        await query.answer()
+        try: uid = int(parts[1])
+        except: return
+        await _safe_edit(query, await payments_text(uid), payments_keyboard(uid))
+        return
+    if parts[0] == "adm_conv":
+        try: conv_id = int(parts[1])
+        except: await query.answer("Invalid.", show_alert=True); return
+        conv = await db_fetchone("SELECT id, user_id, filename, status, quota_source, file_size, created_at, converted_file_id, original_file_id FROM conversions WHERE id = ?", [conv_id])
+        if conv is None: await query.answer("Conversion not found.", show_alert=True); return
+        converted_id = conv.get("converted_file_id")
+        original_id = conv.get("original_file_id")
+        if not converted_id and not original_id: await query.answer("No image stored for this entry (older record).", show_alert=True); return
+        await query.answer("Sending image...")
+        caption = f"📄 {conv['filename'] or '(unknown)'}\n👤 User ID: {conv['user_id']}\n📊 Source: {conv['quota_source'] or '-'} | Size: {conv['file_size'] or '-'} bytes\n🕐 {_dt_display(conv['created_at'])}\n{'✅' if conv['status'] == 'success' else '❌'} Status: {conv['status']}"
+        try:
+            if converted_id: await query.message.reply_document(document=converted_id, caption=caption)
+            else: await query.message.reply_document(document=original_id, caption="⚠️ Original file (JPG not stored).\n\n" + caption)
+        except Exception: logger.exception("Could not send stored file"); await query.message.reply_text("⚠️ Could not fetch the stored file.")
+        return
+    if data == "adm_search":
+        await query.answer()
+        context.user_data["admin_search"] = True
+        await _safe_edit(query, search_prompt_text(), search_prompt_keyboard())
+        return
+    if parts[0] == "adm_recent_conv":
+        await query.answer()
+        try: page = int(parts[1])
+        except: page = 0
+        convs, total = await get_recent_convs(page)
+        await _safe_edit(query, recent_convs_text(page, total), recent_convs_keyboard(convs, page, total))
+        return
+    if parts[0] == "adm_recent_pay":
+        await query.answer()
+        try: page = int(parts[1])
+        except: page = 0
+        pays, total = await get_recent_payments(page)
+        await _safe_edit(query, recent_pays_text(page, total), recent_pays_keyboard(pays, page, total))
+        return
+    await query.answer()
+
+async def _safe_edit(query, text: str, keyboard: InlineKeyboardMarkup | None) -> None:
+    try: await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    except Exception:
+        try: await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        except Exception: logger.exception("Could not render admin view")
+
+async def admin_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    if update.effective_user.id != OWNER_ID: return
+    if not context.user_data.get("admin_search"): return
+    query_text = (update.message.text or "").strip()
+    context.user_data.pop("admin_search", None)
+    if not query_text: await update.message.reply_text("❌ Empty search."); return
+    results = await search_users(query_text)
+    if not results:
+        await update.message.reply_text(f"🔍 No users found matching: `{query_text}`", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 New Search", callback_data="adm_search")], [InlineKeyboardButton("🏠 Dashboard", callback_data="adm_home")]]))
+        return
+    await update.message.reply_text(search_results_text(query_text, len(results)), parse_mode=ParseMode.MARKDOWN, reply_markup=search_results_keyboard(results))
+
+
+# ===========================================================================
+# PAYMENT HANDLERS
+# ===========================================================================
+async def buy_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    await query.answer()
+    if query.data == "buy_20": title, desc, payload, stars = ("20 Image → JPG Conversions", "20 additional conversions.", "plan_20", PAID_CREDIT_PRICE_STARS)
+    elif query.data == "buy_unlimited": title, desc, payload, stars = ("30 Days Unlimited Image → JPG", "Unlimited for 30 days.", "plan_unlimited_30", UNLIMITED_PRICE_STARS)
+    else: return
+    await context.bot.send_invoice(chat_id=query.message.chat_id, title=title, description=desc, payload=payload, currency="XTR", prices=[LabeledPrice(title, stars)])
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if not query: return
+    if query.invoice_payload not in {"plan_20", "plan_unlimited_30"}:
+        await query.answer(ok=False, error_message="Invalid plan."); return
+    await query.answer(ok=True)
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    payment = update.message.successful_payment
+    if not payment: return
+    await ensure_user(update.effective_user)
+    user_id = update.effective_user.id
+    payload = payment.invoice_payload
+    charge_id = payment.telegram_payment_charge_id
+    stars = (PAID_CREDIT_PRICE_STARS if payload == "plan_20" else UNLIMITED_PRICE_STARS if payload == "plan_unlimited_30" else 0)
+    if not stars: return
+    if not await record_payment(user_id, payload, stars, charge_id):
+        logger.warning("Duplicate payment ignored: %s", charge_id); return
+    if payload == "plan_20":
+        await add_paid_credits(user_id, PAID_CREDIT_PACK)
+        await update.message.reply_text("🎉 *Payment successful!*\n\n⭐ *20 credits* added.\n\n" + await entitlement_text(user_id), parse_mode="Markdown")
+    else:
+        await add_unlimited_days(user_id, UNLIMITED_DAYS)
+        await update.message.reply_text("🎉 *Payment successful!*\n\n♾️ *30-day Unlimited* active.\n\n" + await entitlement_text(user_id), parse_mode="Markdown")
+
+
+# ===========================================================================
 # MESSAGE HANDLERS
 # ===========================================================================
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    if update.effective_user.id == OWNER_ID: context.user_data.pop("admin_search", None)
+    await update.message.reply_text("ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\nThis preserves original quality and lets the bot convert it properly.", parse_mode="Markdown")
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     user = update.effective_user
     if not message or not message.document or not user: return
-
+    if user.id == OWNER_ID: context.user_data.pop("admin_search", None)
+    spawn(ensure_user(user))
     document = message.document
     filename = document.file_name or "image.heic"
-
+    
     if not is_supported_file(filename):
-        await message.reply_text("❌ *Unsupported file type.*", parse_mode="Markdown")
+        await message.reply_text("❌ *Unsupported file type.*\n\n📎 Please send one of these formats as a document:\n`HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF`", parse_mode="Markdown")
         return
-
     if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
-        await message.reply_text(f"❌ *File too large.* Max allowed: *{MAX_FILE_SIZE_MB} MB*", parse_mode="Markdown")
+        await message.reply_text(f"❌ *File too large.*\nMax allowed: *{MAX_FILE_SIZE_MB} MB*", parse_mode="Markdown")
         return
-
-    # Check quota (only once)
+        
     allowed, source = await can_convert(user.id)
     if not allowed:
         await message.reply_text("🚫 *Free conversions finished for today.*\n\n💰 Choose a plan to continue:", parse_mode="Markdown", reply_markup=plans_keyboard())
         return
 
-    # 🚀 Add to DB and Queue
     now = now_bd().isoformat()
     await db_execute(
-        """INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+        "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
         [user.id, message.chat_id, document.file_id, filename, document.file_size, source, now]
     )
     
-    # Get the ID of the inserted row
     task_row = await db_fetchone("SELECT last_insert_rowid() as id")
     task_id = task_row["id"] if task_row else None
     
     if task_id:
         await conversion_queue.put(task_id)
         queue_size = conversion_queue.qsize()
-        await message.reply_text(
-            f"📥 *Added to queue.*\n📄 `{filename}`\n⏳ Position: *{queue_size}*\n\n_Processing will start automatically._",
-            parse_mode="Markdown"
-        )
+        await message.reply_text(f"📥 *Added to queue.*\n📄 `{filename}`\n⏳ Position: *{queue_size}*\n\n_Processing will start automatically._", parse_mode="Markdown")
     else:
         await message.reply_text("❌ System error. Please try again.")
 
 
 # ===========================================================================
-# STARTUP & MAIN
+# ERROR HANDLER & STARTUP
 # ===========================================================================
-async def on_startup(application: Application) -> None:
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception: pass
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.warning("Conflict detected: Another bot instance is running. Waiting...")
+        return
+    logger.error("Update %s caused error:", update, exc_info=context.error)
 
+async def on_startup(application: Application) -> None:
+    try: await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception: pass
     await init_database()
-    
-    # 1. Reset any 'processing' tasks back to 'pending' (because bot restarted)
     await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE status = 'processing'")
-    
-    # 2. Load all pending tasks from DB into memory queue
     pending_tasks = await db_fetchall("SELECT id FROM pending_tasks WHERE status = 'pending' ORDER BY id ASC")
     if pending_tasks:
         logger.info(f"📦 Resuming {len(pending_tasks)} pending tasks from database...")
-        for row in pending_tasks:
-            await conversion_queue.put(row["id"])
-            
-    # 3. Start 5 Background Workers
+        for row in pending_tasks: await conversion_queue.put(row["id"])
     for i in range(1, MAX_WORKERS + 1):
         application.create_task(queue_worker(application, i))
+    logger.info("Workers started.")
 
 
+# ===========================================================================
+# MAIN
+# ===========================================================================
 def main() -> None:
-    if not BOT_TOKEN or not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
-        raise RuntimeError("Environment variables missing.")
+    if not BOT_TOKEN or BOT_TOKEN == "REPLACE_WITH_NEW_BOT_TOKEN": raise RuntimeError("BOT_TOKEN is not set.")
+    if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN: raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set.")
+
+    logger.info("=" * 60)
+    logger.info(" Image → JPG Bot  ·  Full Admin Panel + Queue")
+    logger.info(" Owner ID: %s", OWNER_ID)
+    logger.info("=" * 60)
 
     threading.Thread(target=run_flask, daemon=True).start()
-
+    
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -576,9 +1113,30 @@ def main() -> None:
         .build()
     )
 
+    # Commands
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("plans", plans_command))
+    application.add_handler(CommandHandler("status", status_command))
 
+    # Callbacks
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
+    application.add_handler(CallbackQueryHandler(buy_plan_callback, pattern=r"^buy_(20|unlimited)$"))
+    
+    # Payments
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    
+    # Text & Media
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_text))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot is running with Queue System.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
