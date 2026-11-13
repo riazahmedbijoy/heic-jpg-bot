@@ -406,32 +406,35 @@ async def record_conversion(
     original_file_id: str | None = None,
 ) -> None:
     created_at = now_bd().isoformat()
-    await db_execute(
-        """INSERT INTO conversions
-           (user_id, filename, status, quota_source, file_size, created_at,
-            converted_file_id, original_file_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        [user_id, filename, status, quota_source, file_size, created_at,
-         converted_file_id, original_file_id],
-    )
-    if status == "success":
+    try:
         await db_execute(
-            """UPDATE users
-               SET total_conversions = total_conversions + 1,
-                   successful_conversions = successful_conversions + 1,
-                   last_seen_at = ?
-               WHERE user_id = ?""",
-            [created_at, user_id],
+            """INSERT INTO conversions
+               (user_id, filename, status, quota_source, file_size, created_at,
+                converted_file_id, original_file_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [user_id, filename, status, quota_source, file_size, created_at,
+             converted_file_id, original_file_id],
         )
-    elif status == "failed":
-        await db_execute(
-            """UPDATE users
-               SET total_conversions = total_conversions + 1,
-                   failed_conversions = failed_conversions + 1,
-                   last_seen_at = ?
-               WHERE user_id = ?""",
-            [created_at, user_id],
-        )
+        if status == "success":
+            await db_execute(
+                """UPDATE users
+                   SET total_conversions = total_conversions + 1,
+                       successful_conversions = successful_conversions + 1,
+                       last_seen_at = ?
+                   WHERE user_id = ?""",
+                [created_at, user_id],
+            )
+        elif status == "failed":
+            await db_execute(
+                """UPDATE users
+                   SET total_conversions = total_conversions + 1,
+                       failed_conversions = failed_conversions + 1,
+                       last_seen_at = ?
+                   WHERE user_id = ?""",
+                [created_at, user_id],
+            )
+    except Exception as e:
+        logger.error("Failed to record conversion in DB: %s", e)
 
 
 async def search_users(query: str, limit: int = 30) -> list[dict]:
@@ -1374,12 +1377,6 @@ def plans_text() -> str:
 def _decode_heic_smart(input_file: Path) -> Image.Image:
     """
     HEIC ফাইলকে ডিকোড করার আগেই libheif-এর স্কেলিং ফিচার ব্যবহার করে ছোট করা হয়।
-    ফলে ১০৮ মেগাপিক্সেলের ছবিও মাত্র কয়েক মেগাবাইট RAM-এ ডিকোড হয়।
-
-    এটি সমাধান করে:
-    - 9000×12000 (108MP) HEIC → সরাসরি 4096×4096 বা কমে ডিকোড হবে
-    - মেমরি ব্যবহার ~324MB → ~5-15MB
-    - Render Free Tier-এর 512MB RAM-এ সহজেই ফিট
     """
     heif = pillow_heif.open_heif(
         str(input_file),
@@ -1402,15 +1399,14 @@ def _decode_heic_smart(input_file: Path) -> Image.Image:
         # এটিই ম্যাজিক: ডিকোডের সময়ই স্কেল হবে, পুরো ছবি RAM-এ লোড হবে না
         heif = heif.scale(scale)
 
-    # এখানেই শুধু স্কেল করা আকারে ডিকোড হবে
-    pil_img = heif.to_pil()
+    # এখানেই শুধু স্কেল করা আকারে ডিকোড হবে (FIXED: to_pillow)
+    pil_img = heif.to_pillow()
     return pil_img
 
 
 def _decode_other_format(input_file: Path) -> Image.Image:
     """JPG/PNG/WEBP ইত্যাদি ফরম্যাটের জন্য PIL ব্যবহার করে ডিকোড।"""
     img = Image.open(input_file)
-    # draft() সাপোর্ট করলে রিসাইজ করে ডিকোড করবে (JPEG-এর জন্য দ্রুত)
     try:
         img.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
     except Exception:
@@ -1421,8 +1417,6 @@ def _decode_other_format(input_file: Path) -> Image.Image:
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     """
     সব ফরম্যাটের জন্য মেমরি-সাশ্রয়ী কনভার্সন।
-    HEIC → libheif-এর নেটিভ স্কেলিং ব্যবহার করে
-    অন্যান্য → PIL draft + thumbnail
     """
     suffix = input_file.suffix.lower()
     image = None
