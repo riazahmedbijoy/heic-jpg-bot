@@ -96,7 +96,7 @@ conversion_queue = asyncio.Queue()
 user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
-user_status_msg: dict[int, int] = {} # Stores the latest status message ID to delete old ones
+user_status_msg: dict[int, int] = {} # Stores the latest status message ID to delete/resend
 
 # ===========================================================================
 # INITIALIZATION
@@ -370,12 +370,19 @@ async def queue_worker(application: Application, worker_id: int):
                 if user_id in cancelled_users:
                     raise ConversionError("Cancelled by user")
 
+                # 🚀 POSITION CALCULATION
+                batch = user_batches.get(user_id)
+                current_pos = 1
+                if batch:
+                    batch["attempted"] = batch.get("attempted", 0) + 1
+                    current_pos = batch["attempted"]
+
                 with output_file.open("rb") as jpg_file:
                     sent = await bot.send_document(
                         chat_id=chat_id,
                         document=jpg_file,
                         filename=output_filename,
-                        caption=f"✅ Conversion complete!\n📄 `{output_filename}`",
+                        caption=f"✅ Conversion complete! Position {current_pos}\n📄 `{output_filename}`",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 if sent.document:
@@ -1125,7 +1132,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("🚫 *Free conversions finished for today.*\n\n💰 Choose a plan to continue:", parse_mode="Markdown", reply_markup=plans_keyboard())
         return
 
-    # 🚀 Add to Upload Session instead of DB Queue
+    # 🚀 Add to Upload Session
     if user.id not in user_uploads:
         user_uploads[user.id] = []
         
@@ -1143,19 +1150,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         [InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")]
     ])
     
-    # 🚀 VANISHING LOGIC: Delete previous status message if exists
+    text_to_send = (
+        f"📥 *File Added to Upload List*\n"
+        f"📄 `{filename}`\n\n"
+        f"📦 Total files uploaded: *{count}*\n"
+        f"👇 Tap *Done* when you have uploaded all files."
+    )
+
+    # 🚀 DELETE OLD AND SEND NEW LOGIC (To keep it at the bottom)
     if user.id in user_status_msg:
         try:
             await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user.id])
         except Exception:
-            pass # Ignore if already deleted or too old
+            pass # Ignore if already deleted
 
-    # Send the new updated message
+    # Send the new updated message (This will appear at the bottom)
     msg = await message.reply_text(
-        f"📥 *File Added to Upload List*\n"
-        f"📄 `{filename}`\n\n"
-        f"📦 Total files uploaded: *{count}*\n"
-        f"👇 Tap *Done* when you have uploaded all files.",
+        text_to_send,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard
     )
@@ -1179,7 +1190,7 @@ async def start_conversion_callback(update: Update, context: ContextTypes.DEFAUL
     user_uploads[user_id] = []
     cancelled_users.discard(user_id) # Reset cancellation flag
     
-    # 🚀 Delete the upload list message
+    # 🚀 Delete the upload list message because conversion is starting
     if user_id in user_status_msg:
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_status_msg[user_id])
@@ -1200,6 +1211,7 @@ async def start_conversion_callback(update: Update, context: ContextTypes.DEFAUL
         "total": total,
         "completed": 0,
         "failed": 0,
+        "attempted": 0,
         "status_msg_id": status_msg.message_id,
         "chat_id": query.message.chat_id,
         "active": True
