@@ -1,6 +1,6 @@
 """
-Image → JPG Telegram Bot with Turso (Batch Upload + Queue + Progress)
-=====================================================================
+Image → JPG Telegram Bot with Turso (Batch Upload + Queue + Progress + Sticky Keyboard)
+========================================================================================
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ from telegram import (
     InlineKeyboardMarkup,
     LabeledPrice,
     Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -88,7 +91,7 @@ USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
 # 🚀 Concurrency & Queue Settings
-MAX_WORKERS = 2  # 2 Workers is safe for 512MB RAM
+MAX_WORKERS = 2  
 MAX_RETRIES = 3
 conversion_queue = asyncio.Queue()
 
@@ -96,7 +99,7 @@ conversion_queue = asyncio.Queue()
 user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
-user_status_msg: dict[int, int] = {} # Stores the latest status message ID to delete/resend
+user_status_msg: dict[int, int] = {} 
 
 # ===========================================================================
 # INITIALIZATION
@@ -370,12 +373,12 @@ async def queue_worker(application: Application, worker_id: int):
                 if user_id in cancelled_users:
                     raise ConversionError("Cancelled by user")
 
-                # 🚀 POSITION CALCULATION
+                # 🚀 Position Calculation Fixed
                 batch = user_batches.get(user_id)
                 current_pos = 1
                 if batch:
-                    batch["attempted"] = batch.get("attempted", 0) + 1
-                    current_pos = batch["attempted"]
+                    batch["completed"] += 1
+                    current_pos = batch["completed"] + batch["failed"]
 
                 with output_file.open("rb") as jpg_file:
                     sent = await bot.send_document(
@@ -408,10 +411,10 @@ async def queue_worker(application: Application, worker_id: int):
                 
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
-                    batch["completed"] += 1
+                    # completed was already incremented before sending!
                     text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                     
-                    if batch["completed"] == batch["total"]:
+                    if batch["completed"] + batch["failed"] == batch["total"]:
                         text = f"🎉 *All {batch['total']} conversions completed!*"
                         if batch["failed"] > 0:
                             text += f"\n⚠️ *Failed: {batch['failed']}*"
@@ -438,16 +441,12 @@ async def queue_worker(application: Application, worker_id: int):
                         await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
                         spawn(record_conversion(user_id, filename, "failed", source, file_size, None, file_id))
                         logger.error(f"❌ Worker {worker_id} permanently failed: {filename}")
-                        try:
-                            await bot.send_message(chat_id=chat_id, text=f"❌ *Failed to convert.*\n📄 `{filename}`\nReason: `{error_msg[:100]}`", parse_mode="Markdown")
-                        except Exception: pass
                         
                         batch = user_batches.get(user_id)
                         if batch and batch.get("active"):
-                            batch["completed"] += 1
                             batch["failed"] += 1
                             text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
-                            if batch["completed"] == batch["total"]:
+                            if batch["completed"] + batch["failed"] == batch["total"]:
                                 text = f"🎉 *All {batch['total']} conversions completed!*"
                                 if batch["failed"] > 0:
                                     text += f"\n⚠️ *Failed: {batch['failed']}*"
@@ -890,7 +889,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception: pass
         
     await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
-    await update.message.reply_text("✅ All pending uploads and conversions have been stopped instantly.")
+    await update.message.reply_text("✅ All pending uploads and conversions have been stopped instantly.", reply_markup=ReplyKeyboardRemove())
 
 
 # ===========================================================================
@@ -1103,12 +1102,22 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
 
 
 # ===========================================================================
-# MESSAGE HANDLERS
+# MESSAGE HANDLERS & STICKY KEYBOARD
 # ===========================================================================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
     if update.effective_user.id == OWNER_ID: context.user_data.pop("admin_search", None)
     await update.message.reply_text("ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\nThis preserves original quality and lets the bot convert it properly.", parse_mode="Markdown")
+
+def get_reply_keyboard(count: int):
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(f"✅ Done - Start Conversion ({count} files)")],
+            [KeyboardButton("❌ Cancel Upload")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -1144,12 +1153,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     })
     
     count = len(user_uploads[user.id])
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Done - Start Conversion ({count} files)", callback_data="start_conv")],
-        [InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")]
-    ])
-    
     text_to_send = (
         f"📥 *File Added to Upload List*\n"
         f"📄 `{filename}`\n\n"
@@ -1157,63 +1160,71 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"👇 Tap *Done* when you have uploaded all files."
     )
 
-    # 🚀 DELETE OLD AND SEND NEW LOGIC (To keep it at the bottom)
+    # 🚀 Update or Send New with Reply Keyboard
     if user.id in user_status_msg:
         try:
-            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user.id])
+            # Edit text in place (no new messages)
+            await context.bot.edit_message_text(
+                chat_id=message.chat_id,
+                message_id=user_status_msg[user.id],
+                text=text_to_send,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            # Update the sticky keyboard with new count
+            await message.reply_text("🔄", reply_markup=get_reply_keyboard(count))
         except Exception:
-            pass # Ignore if already deleted
+            # Fallback if message was deleted
+            msg = await message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=get_reply_keyboard(count))
+            user_status_msg[user.id] = msg.message_id
+    else:
+        # First upload, send new message with keyboard
+        msg = await message.reply_text(
+            text_to_send,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_reply_keyboard(count)
+        )
+        user_status_msg[user.id] = msg.message_id
 
-    # Send the new updated message (This will appear at the bottom)
-    msg = await message.reply_text(
-        text_to_send,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard
-    )
+
+# 🚀 Sticky Keyboard Handlers
+async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user: return
     
-    # Store the new message ID
-    user_status_msg[user.id] = msg.message_id
-
-
-# 🚀 Start Conversion Callback
-async def start_conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.from_user: return
-    user_id = query.from_user.id
-    
+    user_id = user.id
     if user_id not in user_uploads or not user_uploads[user_id]:
-        await query.answer("No files uploaded yet.", show_alert=True)
+        await message.reply_text("❌ No files uploaded yet.", reply_markup=ReplyKeyboardRemove())
         return
         
     docs = user_uploads[user_id]
     total = len(docs)
     user_uploads[user_id] = []
-    cancelled_users.discard(user_id) # Reset cancellation flag
+    cancelled_users.discard(user_id)
     
-    # 🚀 Delete the upload list message because conversion is starting
+    # Remove keyboard
+    await message.reply_text("⏳ Processing started...", reply_markup=ReplyKeyboardRemove())
+    
+    # Delete the upload list message
     if user_id in user_status_msg:
         try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_status_msg[user_id])
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user_id])
         except Exception: pass
         del user_status_msg[user_id]
     
-    await query.answer("Processing started!")
-    
-    status_msg = await query.message.reply_text(
+    status_msg = await message.reply_text(
         f"🚀 *Starting conversion...*\n\n"
         f"📦 Total files: *{total}*\n"
         f"✅ Completed: *0 / {total}*",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=None
     )
     
     user_batches[user_id] = {
         "total": total,
         "completed": 0,
         "failed": 0,
-        "attempted": 0,
         "status_msg_id": status_msg.message_id,
-        "chat_id": query.message.chat_id,
+        "chat_id": message.chat_id,
         "active": True
     }
     
@@ -1221,32 +1232,29 @@ async def start_conversion_callback(update: Update, context: ContextTypes.DEFAUL
     for doc in docs:
         task_row = await db_fetchone(
             "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
-            [user_id, query.message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now]
+            [user_id, message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now]
         )
         if task_row:
             await conversion_queue.put(task_row["id"])
 
-
-# 🚀 Cancel Upload Callback
-async def cancel_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.from_user: return
-    user_id = query.from_user.id
+async def handle_cancel_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user: return
     
+    user_id = user.id
     count = 0
     if user_id in user_uploads:
         count = len(user_uploads[user_id])
         user_uploads[user_id] = []
         
-    # 🚀 Delete the upload list message
     if user_id in user_status_msg:
         try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_status_msg[user_id])
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user_id])
         except Exception: pass
         del user_status_msg[user_id]
         
-    await query.answer("Upload session cancelled.")
-    await query.message.reply_text(f"❌ Upload cancelled. Removed {count} files.")
+    await message.reply_text(f"❌ Upload cancelled. Removed {count} files.", reply_markup=ReplyKeyboardRemove())
 
 
 # ===========================================================================
@@ -1310,14 +1318,14 @@ def main() -> None:
     # Callbacks
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
     application.add_handler(CallbackQueryHandler(buy_plan_callback, pattern=r"^buy_(20|unlimited)$"))
-    application.add_handler(CallbackQueryHandler(start_conversion_callback, pattern=r"^start_conv$"))
-    application.add_handler(CallbackQueryHandler(cancel_upload_callback, pattern=r"^cancel_upload$"))
     
     # Payments
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     
-    # Text & Media
+    # Text & Media Handlers
+    application.add_handler(MessageHandler(filters.Regex(r"^✅ Done - Start Conversion"), handle_done_keyboard))
+    application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Upload"), handle_cancel_keyboard))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
