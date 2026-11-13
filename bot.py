@@ -135,9 +135,11 @@ def get_upload_keyboard(count: int) -> ReplyKeyboardMarkup:
         one_time_keyboard=False
     )
 
-def get_processing_keyboard() -> ReplyKeyboardMarkup:
+def get_processing_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboardMarkup:
+    btn_text = f"🔄 Converting... ({completed}/{total})" if total > 0 else "🔄 Converting..."
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton(btn_text)],
             [KeyboardButton("❌ Cancel Conversion")]
         ],
         resize_keyboard=True,
@@ -290,7 +292,7 @@ async def record_conversion(user_id: int, filename: str, status: str, source: st
     except: pass
 
 # ===========================================================================
-# PAYMENT & ADMIN HELPERS
+# ADMIN HELPERS
 # ===========================================================================
 async def entitlement_text(user_id: int) -> str:
     if user_id == OWNER_ID: return "👑 Owner: Unlimited"
@@ -326,6 +328,12 @@ async def get_admin_stats() -> dict:
         "payment_count": (await db_fetchone("SELECT COUNT(*) AS c FROM payments"))["c"],
         "total_stars": (await db_fetchone("SELECT COALESCE(SUM(stars), 0) AS c FROM payments"))["c"],
     }
+
+async def search_users(query: str, limit: int = 30) -> list[dict]:
+    q = query.strip()
+    if not q: return []
+    like = f"%{q}%"
+    return await db_fetchall("SELECT * FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(COALESCE(first_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(username, '')) LIKE LOWER(?) ORDER BY last_seen_at DESC LIMIT ?", [like, like, like, limit])
 
 # ===========================================================================
 # 🚀 QUEUE WORKER LOGIC
@@ -391,7 +399,7 @@ async def queue_worker(application: Application, worker_id: int):
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
                     batch["completed"] += 1
-                    text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                    text = f"🔄 *Conversion in Progress...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                     
                     if batch["completed"] + batch["failed"] == batch["total"]:
                         text = f"🎉 *All {batch['total']} conversions completed!*"
@@ -401,15 +409,30 @@ async def queue_worker(application: Application, worker_id: int):
                         
                         try:
                             await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                            await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
+                            await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
                         except: pass
                         
+                        await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
                         conversion_queue.task_done()
                         continue
 
+                    # Update Text
                     try:
                         await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
                     except: pass
+                    
+                    # Update Keyboard (Every 5 files or at the end)
+                    if batch["completed"] % 5 == 0 or (batch["completed"] + batch["failed"] == batch["total"]):
+                        try:
+                            new_kb_msg = await bot.send_message(
+                                chat_id=batch["chat_id"], 
+                                text="\u200b", 
+                                reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
+                            )
+                            try: await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
+                            except: pass
+                            batch["kb_msg_id"] = new_kb_msg.message_id
+                        except: pass
             else:
                 if error_msg == "Cancelled by user":
                     await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
@@ -426,7 +449,7 @@ async def queue_worker(application: Application, worker_id: int):
                         batch = user_batches.get(user_id)
                         if batch and batch.get("active"):
                             batch["failed"] += 1
-                            text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                            text = f"🔄 *Conversion in Progress...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                             if batch["completed"] + batch["failed"] == batch["total"]:
                                 text = f"🎉 *All {batch['total']} conversions completed!*"
                                 if batch["failed"] > 0: text += f"\n⚠️ *Failed: {batch['failed']}*"
@@ -434,8 +457,9 @@ async def queue_worker(application: Application, worker_id: int):
                                 del user_batches[user_id]
                                 try:
                                     await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                                    await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
+                                    await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
                                 except: pass
+                                await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
                                 conversion_queue.task_done()
                                 continue
                             try:
@@ -629,6 +653,20 @@ def search_prompt_text() -> str:
 def search_prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌  Cancel", callback_data="adm_home")]])
 
+def search_results_text(query: str, count: int) -> str:
+    return "\n".join(["🔍  *SEARCH RESULTS*", "━━━━━━━━━━━━━━━━━━━━", "", f"🔎  Query  :  `{query}`", f"📊  Found  :  *{count}*  user(s)", "", "_Tap a user to view details_"])
+
+def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for r in results[:20]:
+        uid = r["user_id"]
+        name = (r["first_name"] or "No name")[:20]
+        total = r["total_conversions"] or 0
+        rows.append([InlineKeyboardButton(f"👤 {name}  ·  {total} conv", callback_data=f"adm_user:{uid}")])
+    rows.append([InlineKeyboardButton("🔍  New Search", callback_data="adm_search")])
+    rows.append([InlineKeyboardButton("🏠  Dashboard", callback_data="adm_home")])
+    return InlineKeyboardMarkup(rows)
+
 def recent_convs_text(page: int, total: int) -> str:
     return "\n".join(["🔄  *RECENT CONVERSIONS*", "━━━━━━━━━━━━━━━━━━━━", "", f"📄  Page  :  *{page + 1}* / *{max(1, math.ceil(total / CONVS_PER_PAGE))}*", f"🔄  Total :  *{total}*", "", "_Tap a conversion to view the image_"])
 
@@ -732,15 +770,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         })
         count = len(user_uploads[user.id])
 
-        if "last_status_msg" in context.user_data:
-            try: await context.bot.delete_message(chat_id=message.chat_id, message_id=context.user_data["last_status_msg"])
-            except: pass
-
+        # 🚀 FIXED: Send new message first, then delete old one to prevent keyboard flickering
         msg = await message.reply_text(
             f"📥 `{filename}`", 
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_upload_keyboard(count)
         )
+        
+        if "last_status_msg" in context.user_data:
+            try: await context.bot.delete_message(chat_id=message.chat_id, message_id=context.user_data["last_status_msg"])
+            except: pass
+
         context.user_data["last_status_msg"] = msg.message_id
 
 
@@ -770,12 +810,14 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     status_msg = await message.reply_text(
         f"🚀 *Starting conversion...*\n\n📦 Total files: *{total}*\n✅ Completed: *0 / {total}*",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=get_processing_keyboard()
+        reply_markup=get_processing_keyboard(0, total)
     )
     
     user_batches[user_id] = {
         "total": total, "completed": 0, "failed": 0,
-        "status_msg_id": status_msg.message_id, "chat_id": message.chat_id, "active": True
+        "status_msg_id": status_msg.message_id, 
+        "kb_msg_id": status_msg.message_id, # Store keyboard message ID separately
+        "chat_id": message.chat_id, "active": True
     }
     
     now = now_bd().isoformat()
@@ -810,7 +852,9 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
     
     batch = user_batches.pop(user_id, None)
     if batch:
-        try: await context.bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text="❌ *Conversion cancelled by user.*", parse_mode=ParseMode.MARKDOWN)
+        try: await context.bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
+        except: pass
+        try: await context.bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
         except: pass
         
     await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
@@ -834,6 +878,33 @@ async def admin_search_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def admin_back_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
     await update.message.reply_text("🏠 Back to Home Menu.", reply_markup=get_main_keyboard(update.effective_user.id))
+
+async def admin_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user: return
+    if update.effective_user.id != OWNER_ID: return
+    if not context.user_data.get("admin_search"): return
+    
+    query_text = (update.message.text or "").strip()
+    context.user_data.pop("admin_search", None)
+    
+    if not query_text: 
+        await update.message.reply_text("❌ Empty search.", reply_markup=get_admin_keyboard())
+        return
+        
+    results = await search_users(query_text)
+    if not results:
+        await update.message.reply_text(
+            f"🔍 No users found matching: `{query_text}`", 
+            parse_mode=ParseMode.MARKDOWN, 
+            reply_markup=get_admin_keyboard()
+        )
+        return
+        
+    await update.message.reply_text(
+        search_results_text(query_text, len(results)), 
+        parse_mode=ParseMode.MARKDOWN, 
+        reply_markup=search_results_keyboard(results)
+    )
 
 
 # ===========================================================================
@@ -983,6 +1054,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Upload$"), handle_cancel_upload))
     application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Conversion$"), handle_cancel_conversion))
     
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_text))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
