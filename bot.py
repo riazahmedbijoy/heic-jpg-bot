@@ -1,6 +1,6 @@
 """
-Image → JPG Telegram Bot with Turso (Batch Upload + Queue + Progress + Sticky Keyboard)
-========================================================================================
+Image → JPG Telegram Bot with Turso (Silent Batch Upload + Queue + Progress + Main Keyboard)
+=============================================================================================
 """
 
 from __future__ import annotations
@@ -99,8 +99,7 @@ conversion_queue = asyncio.Queue()
 user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
-user_status_msg: dict[int, int] = {} 
-user_locks: dict[int, asyncio.Lock] = {} # Prevent race conditions on fast uploads
+user_locks: dict[int, asyncio.Lock] = {}
 
 # ===========================================================================
 # INITIALIZATION
@@ -117,6 +116,29 @@ logging.basicConfig(
     level=LOG_LEVEL,
 )
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# KEYBOARD BUILDERS
+# ===========================================================================
+def get_main_keyboard(user_id: int):
+    rows = [
+        [KeyboardButton("📊 Status"), KeyboardButton("⭐ Plans")],
+        [KeyboardButton("❓ Help")]
+    ]
+    if user_id == OWNER_ID:
+        rows.append([KeyboardButton("👑 Admin Panel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+def get_upload_keyboard(count: int):
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(f"✅ Done - Start Conversion ({count} files)")],
+            [KeyboardButton("❌ Cancel Upload")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 
 # ===========================================================================
@@ -418,6 +440,20 @@ async def queue_worker(application: Application, worker_id: int):
                         batch["active"] = False
                         del user_batches[user_id]
                         
+                        # Send final message with Main Keyboard
+                        try:
+                            await bot.send_message(
+                                chat_id=batch["chat_id"],
+                                text=text + "\n\n👇 Use the menu below.",
+                                parse_mode=ParseMode.MARKDOWN,
+                                reply_markup=get_main_keyboard(user_id)
+                            )
+                            # Try deleting the inline progress message
+                            await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
+                        except Exception: pass
+                        conversion_queue.task_done()
+                        continue
+
                     try:
                         await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
                     except telegram.error.RetryAfter as e:
@@ -449,6 +485,20 @@ async def queue_worker(application: Application, worker_id: int):
                                     text += f"\n⚠️ *Failed: {batch['failed']}*"
                                 batch["active"] = False
                                 del user_batches[user_id]
+                                
+                                # Send final message with Main Keyboard
+                                try:
+                                    await bot.send_message(
+                                        chat_id=batch["chat_id"],
+                                        text=text + "\n\n👇 Use the menu below.",
+                                        parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=get_main_keyboard(user_id)
+                                    )
+                                    await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
+                                except Exception: pass
+                                conversion_queue.task_done()
+                                continue
+
                             try:
                                 await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
                             except Exception: pass
@@ -823,11 +873,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📊 /status — check your remaining\n"
         "⭐ /plans — paid plans\n"
         "❓ /help — help",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+    if not update.message or not update.effective_user: return
     await update.message.reply_text(
         "📸 Image → JPG Converter\n\n"
         "1. Send your images as documents (📎 → File).\n"
@@ -837,12 +888,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
         "Max file size: 20 MB\n\n"
         "Free: 5 successful conversions/day.\n\n"
-        "Commands:\n/start /help /plans /status /cancel"
+        "Commands:\n/start /help /plans /status /cancel",
+        reply_markup=get_main_keyboard(update.effective_user.id)
     )
 
 async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    await update.message.reply_text(plans_text(), parse_mode="Markdown", reply_markup=plans_keyboard())
+    if not update.message or not update.effective_user: return
+    await update.message.reply_text(
+        plans_text(), 
+        parse_mode="Markdown", 
+        reply_markup=plans_keyboard()
+    )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
@@ -856,7 +912,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         free_left = max(0, FREE_DAILY_LIMIT - row["free_used"])
         text = (f"📊 Status\n\n🆓 Free left today: {free_left}/{FREE_DAILY_LIMIT}\n"
                 f"⭐ Paid credits: {row['paid_credits']}\n\n💰 /plans")
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(update.effective_user.id))
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
@@ -866,13 +922,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 🚀 Instant Cancellation
     cancelled_users.add(user_id)
     user_uploads.pop(user_id, None)
-    
-    # Delete status message if exists
-    if user_id in user_status_msg:
-        try:
-            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=user_status_msg[user_id])
-        except Exception: pass
-        del user_status_msg[user_id]
     
     batch = user_batches.pop(user_id, None)
     if batch:
@@ -886,7 +935,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception: pass
         
     await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
-    await update.message.reply_text("✅ All pending uploads and conversions have been stopped instantly.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("✅ All pending uploads and conversions have been stopped instantly.", reply_markup=get_main_keyboard(user_id))
 
 
 # ===========================================================================
@@ -895,7 +944,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Owner only.")
+        await update.message.reply_text("⛔ Owner only.", reply_markup=get_main_keyboard(update.effective_user.id))
         return
     context.user_data.pop("admin_search", None)
     args = context.args or []
@@ -1092,10 +1141,10 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         logger.warning("Duplicate payment ignored: %s", charge_id); return
     if payload == "plan_20":
         await add_paid_credits(user_id, PAID_CREDIT_PACK)
-        await update.message.reply_text("🎉 *Payment successful!*\n\n⭐ *20 credits* added.\n\n" + await entitlement_text(user_id), parse_mode="Markdown")
+        await update.message.reply_text("🎉 *Payment successful!*\n\n⭐ *20 credits* added.\n\n" + await entitlement_text(user_id), parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
     else:
         await add_unlimited_days(user_id, UNLIMITED_DAYS)
-        await update.message.reply_text("🎉 *Payment successful!*\n\n♾️ *30-day Unlimited* active.\n\n" + await entitlement_text(user_id), parse_mode="Markdown")
+        await update.message.reply_text("🎉 *Payment successful!*\n\n♾️ *30-day Unlimited* active.\n\n" + await entitlement_text(user_id), parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
 
 
 # ===========================================================================
@@ -1105,16 +1154,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.effective_user: return
     if update.effective_user.id == OWNER_ID: context.user_data.pop("admin_search", None)
     await update.message.reply_text("ℹ️ Please send your image as a *document* (📎 → File), not as a photo.\n\nThis preserves original quality and lets the bot convert it properly.", parse_mode="Markdown")
-
-def get_reply_keyboard(count: int):
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(f"✅ Done - Start Conversion ({count} files)")],
-            [KeyboardButton("❌ Cancel Upload")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -1155,36 +1194,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         count = len(user_uploads[user.id])
         
-        # Clean text (No total files uploaded here)
-        text_to_send = (
-            f"📥 *File Added to Upload List*\n"
-            f"📄 `{filename}`\n\n"
-            f"👇 Tap *Done* when you have uploaded all files."
+        # 🚀 SILENT UPDATE: Send a zero-width space message, then delete it.
+        # This updates the floating keyboard without showing text to the user.
+        msg = await message.reply_text(
+            "\u200b", 
+            reply_markup=get_upload_keyboard(count)
         )
-
-        if user.id in user_status_msg:
-            try:
-                # Edit text in place (no new messages)
-                await context.bot.edit_message_text(
-                    chat_id=message.chat_id,
-                    message_id=user_status_msg[user.id],
-                    text=text_to_send,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                # Send invisible message to update the sticky keyboard
-                await message.reply_text("\u200b", reply_markup=get_reply_keyboard(count))
-            except Exception:
-                # Fallback if message was deleted
-                msg = await message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=get_reply_keyboard(count))
-                user_status_msg[user.id] = msg.message_id
-        else:
-            # First upload, send new message with keyboard
-            msg = await message.reply_text(
-                text_to_send,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_reply_keyboard(count)
-            )
-            user_status_msg[user.id] = msg.message_id
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 
 # 🚀 Sticky Keyboard Handlers
@@ -1195,7 +1214,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     
     user_id = user.id
     if user_id not in user_uploads or not user_uploads[user_id]:
-        await message.reply_text("❌ No files uploaded yet.", reply_markup=ReplyKeyboardRemove())
+        await message.reply_text("❌ No files uploaded yet.", reply_markup=get_main_keyboard(user_id))
         return
         
     docs = user_uploads[user_id]
@@ -1205,13 +1224,6 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Remove keyboard
     await message.reply_text("⏳ Processing started...", reply_markup=ReplyKeyboardRemove())
-    
-    # Delete the upload list message
-    if user_id in user_status_msg:
-        try:
-            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user_id])
-        except Exception: pass
-        del user_status_msg[user_id]
     
     status_msg = await message.reply_text(
         f"🚀 *Starting conversion...*\n\n"
@@ -1249,13 +1261,7 @@ async def handle_cancel_keyboard(update: Update, context: ContextTypes.DEFAULT_T
         count = len(user_uploads[user_id])
         user_uploads[user_id] = []
         
-    if user_id in user_status_msg:
-        try:
-            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user_id])
-        except Exception: pass
-        del user_status_msg[user_id]
-        
-    await message.reply_text(f"❌ Upload cancelled. Removed {count} files.", reply_markup=ReplyKeyboardRemove())
+    await message.reply_text(f"❌ Upload cancelled. Removed {count} files.", reply_markup=get_main_keyboard(user_id))
 
 
 # ===========================================================================
@@ -1324,9 +1330,16 @@ def main() -> None:
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     
-    # Text & Media Handlers
+    # Keyboard Text Handlers (Must be before TEXT handler)
+    application.add_handler(MessageHandler(filters.Regex(r"^📊 Status$"), status_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^⭐ Plans$"), plans_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^❓ Help$"), help_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^👑 Admin Panel$"), admin_command))
+    
     application.add_handler(MessageHandler(filters.Regex(r"^✅ Done - Start Conversion"), handle_done_keyboard))
     application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Upload"), handle_cancel_keyboard))
+    
+    # General Handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
