@@ -192,7 +192,7 @@ async def init_database() -> None:
         )
         """
     )
-    # 🚀 NEW: Pending Tasks Table for Queue & Auto-Resume
+    # 🚀 Pending Tasks Table
     await db_execute(
         """
         CREATE TABLE IF NOT EXISTS pending_tasks (
@@ -1048,12 +1048,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     now = now_bd().isoformat()
-    await db_execute(
-        "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+    
+    # 🚀 FIX: Use RETURNING id instead of last_insert_rowid()
+    task_row = await db_fetchone(
+        "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
         [user.id, message.chat_id, document.file_id, filename, document.file_size, source, now]
     )
-    
-    task_row = await db_fetchone("SELECT last_insert_rowid() as id")
     task_id = task_row["id"] if task_row else None
     
     if task_id:
@@ -1083,7 +1083,7 @@ async def on_startup(application: Application) -> None:
         logger.info(f"📦 Resuming {len(pending_tasks)} pending tasks from database...")
         for row in pending_tasks: await conversion_queue.put(row["id"])
     for i in range(1, MAX_WORKERS + 1):
-        application.create_task(queue_worker(application, i))
+        asyncio.create_task(queue_worker(application, i)) # 🚀 FIX: use asyncio.create_task
     logger.info("Workers started.")
 
 
