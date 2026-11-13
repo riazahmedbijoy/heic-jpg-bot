@@ -88,13 +88,15 @@ USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
 # 🚀 Concurrency & Queue Settings
-MAX_WORKERS = 5
+MAX_WORKERS = 2  # 2 Workers is safe for 512MB RAM
 MAX_RETRIES = 3
 conversion_queue = asyncio.Queue()
 
 # 🚀 Upload & Batch Tracking
-user_uploads: dict[int, list[dict]] = {}  # {user_id: [documents]}
-user_batches: dict[int, dict] = {}        # {user_id: {total, completed, failed, status_msg_id, chat_id, active}}
+user_uploads: dict[int, list[dict]] = {}
+user_batches: dict[int, dict] = {}
+cancelled_users: set[int] = set()
+user_status_msg: dict[int, int] = {} # Stores the latest status message ID to delete old ones
 
 # ===========================================================================
 # INITIALIZATION
@@ -196,7 +198,6 @@ async def init_database() -> None:
         )
         """
     )
-    # 🚀 Pending Tasks Table
     await db_execute(
         """
         CREATE TABLE IF NOT EXISTS pending_tasks (
@@ -329,11 +330,16 @@ async def queue_worker(application: Application, worker_id: int):
                 conversion_queue.task_done()
                 continue
 
+            user_id = task["user_id"]
+            if user_id in cancelled_users:
+                await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
+                conversion_queue.task_done()
+                continue
+
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task_id])
 
             file_id = task["file_id"]
             filename = task["filename"]
-            user_id = task["user_id"]
             chat_id = task["chat_id"]
             source = task["source"]
             file_size = task["file_size"]
@@ -350,14 +356,20 @@ async def queue_worker(application: Application, worker_id: int):
             error_msg = ""
 
             try:
-                # 1. Download
+                if user_id in cancelled_users:
+                    raise ConversionError("Cancelled by user")
+
                 tg_file = await bot.get_file(file_id)
                 await tg_file.download_to_drive(input_file)
 
-                # 2. Convert
+                if user_id in cancelled_users:
+                    raise ConversionError("Cancelled by user")
+
                 await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
 
-                # 3. Upload
+                if user_id in cancelled_users:
+                    raise ConversionError("Cancelled by user")
+
                 with output_file.open("rb") as jpg_file:
                     sent = await bot.send_document(
                         chat_id=chat_id,
@@ -387,7 +399,6 @@ async def queue_worker(application: Application, worker_id: int):
                 spawn(record_conversion(user_id, filename, "success", source, file_size, converted_file_id, file_id))
                 logger.info(f"✅ Worker {worker_id} processed: {filename}")
                 
-                # 🚀 Update Progress
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
                     batch["completed"] += 1
@@ -407,35 +418,37 @@ async def queue_worker(application: Application, worker_id: int):
                     except Exception: pass
 
             else:
-                retry_count += 1
-                if retry_count <= MAX_RETRIES:
-                    await db_execute("UPDATE pending_tasks SET retry_count = ?, status = 'pending' WHERE id = ?", [retry_count, task_id])
-                    await asyncio.sleep(2)
-                    await conversion_queue.put(task_id)
-                    logger.warning(f"⚠️ Worker {worker_id} failed {filename}. Retry {retry_count}/{MAX_RETRIES}.")
+                if error_msg == "Cancelled by user":
+                    await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
                 else:
-                    await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
-                    spawn(record_conversion(user_id, filename, "failed", source, file_size, None, file_id))
-                    logger.error(f"❌ Worker {worker_id} permanently failed: {filename}")
-                    try:
-                        await bot.send_message(chat_id=chat_id, text=f"❌ *Failed to convert.*\n📄 `{filename}`\nReason: `{error_msg[:100]}`", parse_mode="Markdown")
-                    except Exception: pass
-                    
-                    # 🚀 Update Progress on Fail
-                    batch = user_batches.get(user_id)
-                    if batch and batch.get("active"):
-                        batch["completed"] += 1
-                        batch["failed"] += 1
-                        text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
-                        if batch["completed"] == batch["total"]:
-                            text = f"🎉 *All {batch['total']} conversions completed!*"
-                            if batch["failed"] > 0:
-                                text += f"\n⚠️ *Failed: {batch['failed']}*"
-                            batch["active"] = False
-                            del user_batches[user_id]
+                    retry_count += 1
+                    if retry_count <= MAX_RETRIES:
+                        await db_execute("UPDATE pending_tasks SET retry_count = ?, status = 'pending' WHERE id = ?", [retry_count, task_id])
+                        await asyncio.sleep(2)
+                        await conversion_queue.put(task_id)
+                        logger.warning(f"⚠️ Worker {worker_id} failed {filename}. Retry {retry_count}/{MAX_RETRIES}.")
+                    else:
+                        await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
+                        spawn(record_conversion(user_id, filename, "failed", source, file_size, None, file_id))
+                        logger.error(f"❌ Worker {worker_id} permanently failed: {filename}")
                         try:
-                            await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                            await bot.send_message(chat_id=chat_id, text=f"❌ *Failed to convert.*\n📄 `{filename}`\nReason: `{error_msg[:100]}`", parse_mode="Markdown")
                         except Exception: pass
+                        
+                        batch = user_batches.get(user_id)
+                        if batch and batch.get("active"):
+                            batch["completed"] += 1
+                            batch["failed"] += 1
+                            text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                            if batch["completed"] == batch["total"]:
+                                text = f"🎉 *All {batch['total']} conversions completed!*"
+                                if batch["failed"] > 0:
+                                    text += f"\n⚠️ *Failed: {batch['failed']}*"
+                                batch["active"] = False
+                                del user_batches[user_id]
+                            try:
+                                await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                            except Exception: pass
 
             # 5. Cleanup
             safe_unlink(input_file)
@@ -816,7 +829,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📸 Image → JPG Converter\n\n"
         "1. Send your images as documents (📎 → File).\n"
         "2. Send as many as you want.\n"
-        "3. Tap **✅ Start Conversion** when you finish uploading.\n"
+        "3. Tap **✅ Done - Start Conversion** when you finish uploading.\n"
         "4. Use /cancel to stop everything.\n\n"
         "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
         "Max file size: 20 MB\n\n"
@@ -847,27 +860,30 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     context.user_data.pop("admin_search", None)
     
-    # Cancel uploads
-    if user_id in user_uploads:
-        user_uploads[user_id] = []
-        
-    # Cancel batches
-    if user_id in user_batches:
-        batch = user_batches[user_id]
-        batch["active"] = False
+    # 🚀 Instant Cancellation
+    cancelled_users.add(user_id)
+    user_uploads.pop(user_id, None)
+    
+    # Delete status message if exists
+    if user_id in user_status_msg:
+        try:
+            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=user_status_msg[user_id])
+        except Exception: pass
+        del user_status_msg[user_id]
+    
+    batch = user_batches.pop(user_id, None)
+    if batch:
         try:
             await context.bot.edit_message_text(
                 chat_id=batch["chat_id"],
                 message_id=batch["status_msg_id"],
-                text="❌ *Conversion cancelled by user.*",
+                text="❌ *All processing cancelled by user.*",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception: pass
         
-    # Cancel DB tasks
     await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
-    
-    await update.message.reply_text("✅ All pending uploads and conversions have been cancelled.")
+    await update.message.reply_text("✅ All pending uploads and conversions have been stopped instantly.")
 
 
 # ===========================================================================
@@ -1123,18 +1139,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     count = len(user_uploads[user.id])
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Start Conversion ({count} files)", callback_data="start_conv")],
+        [InlineKeyboardButton(f"✅ Done - Start Conversion ({count} files)", callback_data="start_conv")],
         [InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")]
     ])
     
-    await message.reply_text(
+    # 🚀 VANISHING LOGIC: Delete previous status message if exists
+    if user.id in user_status_msg:
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=user_status_msg[user.id])
+        except Exception:
+            pass # Ignore if already deleted or too old
+
+    # Send the new updated message
+    msg = await message.reply_text(
         f"📥 *File Added to Upload List*\n"
         f"📄 `{filename}`\n\n"
         f"📦 Total files uploaded: *{count}*\n"
-        f"👇 Tap *Start Conversion* when you are done.",
+        f"👇 Tap *Done* when you have uploaded all files.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard
     )
+    
+    # Store the new message ID
+    user_status_msg[user.id] = msg.message_id
 
 
 # 🚀 Start Conversion Callback
@@ -1150,10 +1177,18 @@ async def start_conversion_callback(update: Update, context: ContextTypes.DEFAUL
     docs = user_uploads[user_id]
     total = len(docs)
     user_uploads[user_id] = []
+    cancelled_users.discard(user_id) # Reset cancellation flag
+    
+    # 🚀 Delete the upload list message
+    if user_id in user_status_msg:
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_status_msg[user_id])
+        except Exception: pass
+        del user_status_msg[user_id]
     
     await query.answer("Processing started!")
     
-    status_msg = await query.message.edit_text(
+    status_msg = await query.message.reply_text(
         f"🚀 *Starting conversion...*\n\n"
         f"📦 Total files: *{total}*\n"
         f"✅ Completed: *0 / {total}*",
@@ -1191,8 +1226,15 @@ async def cancel_upload_callback(update: Update, context: ContextTypes.DEFAULT_T
         count = len(user_uploads[user_id])
         user_uploads[user_id] = []
         
+    # 🚀 Delete the upload list message
+    if user_id in user_status_msg:
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_status_msg[user_id])
+        except Exception: pass
+        del user_status_msg[user_id]
+        
     await query.answer("Upload session cancelled.")
-    await query.edit_message_text(f"❌ Upload cancelled. Removed {count} files.")
+    await query.message.reply_text(f"❌ Upload cancelled. Removed {count} files.")
 
 
 # ===========================================================================
@@ -1213,6 +1255,7 @@ async def on_startup(application: Application) -> None:
     if pending_tasks:
         logger.info(f"📦 Resuming {len(pending_tasks)} pending tasks from database...")
         for row in pending_tasks: await conversion_queue.put(row["id"])
+    
     for i in range(1, MAX_WORKERS + 1):
         asyncio.create_task(queue_worker(application, i))
     logger.info("Workers started.")
