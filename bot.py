@@ -1,6 +1,6 @@
 """
-Image → JPG Telegram Bot with Turso (Queue System + Auto-Retry + Resume)
-========================================================================
+Image → JPG Telegram Bot with Turso (Batch Upload + Queue + Progress)
+=====================================================================
 """
 
 from __future__ import annotations
@@ -91,6 +91,10 @@ CONVS_PER_PAGE = 8
 MAX_WORKERS = 5
 MAX_RETRIES = 3
 conversion_queue = asyncio.Queue()
+
+# 🚀 Upload & Batch Tracking
+user_uploads: dict[int, list[dict]] = {}  # {user_id: [documents]}
+user_batches: dict[int, dict] = {}        # {user_id: {total, completed, failed, status_msg_id, chat_id, active}}
 
 # ===========================================================================
 # INITIALIZATION
@@ -321,7 +325,7 @@ async def queue_worker(application: Application, worker_id: int):
             task_id = await conversion_queue.get()
             
             task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ? AND status IN ('pending', 'processing')", [task_id])
-            if not task:
+            if not task or task["status"] == "cancelled":
                 conversion_queue.task_done()
                 continue
 
@@ -382,6 +386,26 @@ async def queue_worker(application: Application, worker_id: int):
                 spawn(consume_conversion(user_id, source))
                 spawn(record_conversion(user_id, filename, "success", source, file_size, converted_file_id, file_id))
                 logger.info(f"✅ Worker {worker_id} processed: {filename}")
+                
+                # 🚀 Update Progress
+                batch = user_batches.get(user_id)
+                if batch and batch.get("active"):
+                    batch["completed"] += 1
+                    text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                    
+                    if batch["completed"] == batch["total"]:
+                        text = f"🎉 *All {batch['total']} conversions completed!*"
+                        if batch["failed"] > 0:
+                            text += f"\n⚠️ *Failed: {batch['failed']}*"
+                        batch["active"] = False
+                        del user_batches[user_id]
+                        
+                    try:
+                        await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                    except telegram.error.RetryAfter as e:
+                        await asyncio.sleep(e.retry_after)
+                    except Exception: pass
+
             else:
                 retry_count += 1
                 if retry_count <= MAX_RETRIES:
@@ -394,12 +418,24 @@ async def queue_worker(application: Application, worker_id: int):
                     spawn(record_conversion(user_id, filename, "failed", source, file_size, None, file_id))
                     logger.error(f"❌ Worker {worker_id} permanently failed: {filename}")
                     try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ *Failed to convert.*\n📄 `{filename}`\nReason: `{error_msg[:100]}`",
-                            parse_mode="Markdown"
-                        )
+                        await bot.send_message(chat_id=chat_id, text=f"❌ *Failed to convert.*\n📄 `{filename}`\nReason: `{error_msg[:100]}`", parse_mode="Markdown")
                     except Exception: pass
+                    
+                    # 🚀 Update Progress on Fail
+                    batch = user_batches.get(user_id)
+                    if batch and batch.get("active"):
+                        batch["completed"] += 1
+                        batch["failed"] += 1
+                        text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                        if batch["completed"] == batch["total"]:
+                            text = f"🎉 *All {batch['total']} conversions completed!*"
+                            if batch["failed"] > 0:
+                                text += f"\n⚠️ *Failed: {batch['failed']}*"
+                            batch["active"] = False
+                            del user_batches[user_id]
+                        try:
+                            await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                        except Exception: pass
 
             # 5. Cleanup
             safe_unlink(input_file)
@@ -766,23 +802,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "1️⃣ Tap 📎 Attachment\n"
         "2️⃣ Choose File (not Photo)\n"
         "3️⃣ Select an image (HEIC, JPG, PNG, WEBP, etc.)\n"
-        "4️⃣ Receive your JPG\n\n"
+        "4️⃣ Upload multiple files, then tap *Done* to start.\n\n"
         "🆓 5 free conversions every day.\n\n"
         "📊 /status — check your remaining\n"
         "⭐ /plans — paid plans\n"
-        "❓ /help — help"
+        "❓ /help — help",
+        parse_mode="Markdown"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message: return
     await update.message.reply_text(
         "📸 Image → JPG Converter\n\n"
-        "Send your image as a document (📎 → File).\n\n"
+        "1. Send your images as documents (📎 → File).\n"
+        "2. Send as many as you want.\n"
+        "3. Tap **✅ Start Conversion** when you finish uploading.\n"
+        "4. Use /cancel to stop everything.\n\n"
         "Supported: HEIC, HEIF, JPG, JPEG, PNG, WEBP, BMP, TIFF\n"
         "Max file size: 20 MB\n\n"
-        "Large HEIC photos are automatically resized for efficiency.\n\n"
         "Free: 5 successful conversions/day.\n\n"
-        "Commands:\n/start /help /plans /status"
+        "Commands:\n/start /help /plans /status /cancel"
     )
 
 async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,8 +844,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
+    user_id = update.effective_user.id
     context.user_data.pop("admin_search", None)
-    await update.message.reply_text("✅ Cancelled.")
+    
+    # Cancel uploads
+    if user_id in user_uploads:
+        user_uploads[user_id] = []
+        
+    # Cancel batches
+    if user_id in user_batches:
+        batch = user_batches[user_id]
+        batch["active"] = False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=batch["chat_id"],
+                message_id=batch["status_msg_id"],
+                text="❌ *Conversion cancelled by user.*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception: pass
+        
+    # Cancel DB tasks
+    await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
+    
+    await update.message.reply_text("✅ All pending uploads and conversions have been cancelled.")
 
 
 # ===========================================================================
@@ -1032,6 +1093,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message or not message.document or not user: return
     if user.id == OWNER_ID: context.user_data.pop("admin_search", None)
     spawn(ensure_user(user))
+    
     document = message.document
     filename = document.file_name or "image.heic"
     
@@ -1047,21 +1109,90 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("🚫 *Free conversions finished for today.*\n\n💰 Choose a plan to continue:", parse_mode="Markdown", reply_markup=plans_keyboard())
         return
 
-    now = now_bd().isoformat()
+    # 🚀 Add to Upload Session instead of DB Queue
+    if user.id not in user_uploads:
+        user_uploads[user.id] = []
+        
+    user_uploads[user.id].append({
+        "file_id": document.file_id,
+        "filename": filename,
+        "file_size": document.file_size,
+        "source": source
+    })
     
-    # 🚀 FIX: Use RETURNING id instead of last_insert_rowid()
-    task_row = await db_fetchone(
-        "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
-        [user.id, message.chat_id, document.file_id, filename, document.file_size, source, now]
+    count = len(user_uploads[user.id])
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Start Conversion ({count} files)", callback_data="start_conv")],
+        [InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")]
+    ])
+    
+    await message.reply_text(
+        f"📥 *File Added to Upload List*\n"
+        f"📄 `{filename}`\n\n"
+        f"📦 Total files uploaded: *{count}*\n"
+        f"👇 Tap *Start Conversion* when you are done.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
     )
-    task_id = task_row["id"] if task_row else None
+
+
+# 🚀 Start Conversion Callback
+async def start_conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    user_id = query.from_user.id
     
-    if task_id:
-        await conversion_queue.put(task_id)
-        queue_size = conversion_queue.qsize()
-        await message.reply_text(f"📥 *Added to queue.*\n📄 `{filename}`\n⏳ Position: *{queue_size}*\n\n_Processing will start automatically._", parse_mode="Markdown")
-    else:
-        await message.reply_text("❌ System error. Please try again.")
+    if user_id not in user_uploads or not user_uploads[user_id]:
+        await query.answer("No files uploaded yet.", show_alert=True)
+        return
+        
+    docs = user_uploads[user_id]
+    total = len(docs)
+    user_uploads[user_id] = []
+    
+    await query.answer("Processing started!")
+    
+    status_msg = await query.message.edit_text(
+        f"🚀 *Starting conversion...*\n\n"
+        f"📦 Total files: *{total}*\n"
+        f"✅ Completed: *0 / {total}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=None
+    )
+    
+    user_batches[user_id] = {
+        "total": total,
+        "completed": 0,
+        "failed": 0,
+        "status_msg_id": status_msg.message_id,
+        "chat_id": query.message.chat_id,
+        "active": True
+    }
+    
+    now = now_bd().isoformat()
+    for doc in docs:
+        task_row = await db_fetchone(
+            "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
+            [user_id, query.message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now]
+        )
+        if task_row:
+            await conversion_queue.put(task_row["id"])
+
+
+# 🚀 Cancel Upload Callback
+async def cancel_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    user_id = query.from_user.id
+    
+    count = 0
+    if user_id in user_uploads:
+        count = len(user_uploads[user_id])
+        user_uploads[user_id] = []
+        
+    await query.answer("Upload session cancelled.")
+    await query.edit_message_text(f"❌ Upload cancelled. Removed {count} files.")
 
 
 # ===========================================================================
@@ -1083,7 +1214,7 @@ async def on_startup(application: Application) -> None:
         logger.info(f"📦 Resuming {len(pending_tasks)} pending tasks from database...")
         for row in pending_tasks: await conversion_queue.put(row["id"])
     for i in range(1, MAX_WORKERS + 1):
-        asyncio.create_task(queue_worker(application, i)) # 🚀 FIX: use asyncio.create_task
+        asyncio.create_task(queue_worker(application, i))
     logger.info("Workers started.")
 
 
@@ -1124,6 +1255,8 @@ def main() -> None:
     # Callbacks
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
     application.add_handler(CallbackQueryHandler(buy_plan_callback, pattern=r"^buy_(20|unlimited)$"))
+    application.add_handler(CallbackQueryHandler(start_conversion_callback, pattern=r"^start_conv$"))
+    application.add_handler(CallbackQueryHandler(cancel_upload_callback, pattern=r"^cancel_upload$"))
     
     # Payments
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
