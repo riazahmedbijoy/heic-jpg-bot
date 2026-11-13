@@ -100,6 +100,7 @@ user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
 user_status_msg: dict[int, int] = {} 
+user_locks: dict[int, asyncio.Lock] = {} # Prevent race conditions on fast uploads
 
 # ===========================================================================
 # INITIALIZATION
@@ -207,12 +208,14 @@ async def init_database() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL, file_id TEXT NOT NULL, filename TEXT,
             file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'pending', created_at TEXT NOT NULL
+            status TEXT DEFAULT 'pending', created_at TEXT NOT NULL,
+            position INTEGER DEFAULT 1
         )
         """
     )
     await _safe_alter("ALTER TABLE conversions ADD COLUMN converted_file_id TEXT")
     await _safe_alter("ALTER TABLE conversions ADD COLUMN original_file_id TEXT")
+    await _safe_alter("ALTER TABLE pending_tasks ADD COLUMN position INTEGER DEFAULT 1")
     logger.info("Database schema ready.")
 
 
@@ -347,6 +350,7 @@ async def queue_worker(application: Application, worker_id: int):
             source = task["source"]
             file_size = task["file_size"]
             retry_count = task["retry_count"]
+            position = task.get("position", 1)
 
             extension = Path(filename).suffix.lower()
             unique_id = f"task_{task_id}"
@@ -373,19 +377,12 @@ async def queue_worker(application: Application, worker_id: int):
                 if user_id in cancelled_users:
                     raise ConversionError("Cancelled by user")
 
-                # 🚀 Position Calculation Fixed
-                batch = user_batches.get(user_id)
-                current_pos = 1
-                if batch:
-                    batch["completed"] += 1
-                    current_pos = batch["completed"] + batch["failed"]
-
                 with output_file.open("rb") as jpg_file:
                     sent = await bot.send_document(
                         chat_id=chat_id,
                         document=jpg_file,
                         filename=output_filename,
-                        caption=f"✅ Conversion complete! Position {current_pos}\n📄 `{output_filename}`",
+                        caption=f"✅ Conversion complete! Position {position}\n📄 `{output_filename}`",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 if sent.document:
@@ -411,7 +408,7 @@ async def queue_worker(application: Application, worker_id: int):
                 
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
-                    # completed was already incremented before sending!
+                    batch["completed"] += 1
                     text = f"🔄 *Conversion in Progress...*\n\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                     
                     if batch["completed"] + batch["failed"] == batch["total"]:
@@ -1141,49 +1138,53 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("🚫 *Free conversions finished for today.*\n\n💰 Choose a plan to continue:", parse_mode="Markdown", reply_markup=plans_keyboard())
         return
 
-    # 🚀 Add to Upload Session
-    if user.id not in user_uploads:
-        user_uploads[user.id] = []
+    # Use Lock to prevent simultaneous update of counts
+    if user.id not in user_locks:
+        user_locks[user.id] = asyncio.Lock()
         
-    user_uploads[user.id].append({
-        "file_id": document.file_id,
-        "filename": filename,
-        "file_size": document.file_size,
-        "source": source
-    })
-    
-    count = len(user_uploads[user.id])
-    text_to_send = (
-        f"📥 *File Added to Upload List*\n"
-        f"📄 `{filename}`\n\n"
-        f"📦 Total files uploaded: *{count}*\n"
-        f"👇 Tap *Done* when you have uploaded all files."
-    )
-
-    # 🚀 Update or Send New with Reply Keyboard
-    if user.id in user_status_msg:
-        try:
-            # Edit text in place (no new messages)
-            await context.bot.edit_message_text(
-                chat_id=message.chat_id,
-                message_id=user_status_msg[user.id],
-                text=text_to_send,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            # Update the sticky keyboard with new count
-            await message.reply_text("🔄", reply_markup=get_reply_keyboard(count))
-        except Exception:
-            # Fallback if message was deleted
-            msg = await message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=get_reply_keyboard(count))
-            user_status_msg[user.id] = msg.message_id
-    else:
-        # First upload, send new message with keyboard
-        msg = await message.reply_text(
-            text_to_send,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_reply_keyboard(count)
+    async with user_locks[user.id]:
+        if user.id not in user_uploads:
+            user_uploads[user.id] = []
+            
+        user_uploads[user.id].append({
+            "file_id": document.file_id,
+            "filename": filename,
+            "file_size": document.file_size,
+            "source": source
+        })
+        
+        count = len(user_uploads[user.id])
+        
+        # Clean text (No total files uploaded here)
+        text_to_send = (
+            f"📥 *File Added to Upload List*\n"
+            f"📄 `{filename}`\n\n"
+            f"👇 Tap *Done* when you have uploaded all files."
         )
-        user_status_msg[user.id] = msg.message_id
+
+        if user.id in user_status_msg:
+            try:
+                # Edit text in place (no new messages)
+                await context.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=user_status_msg[user.id],
+                    text=text_to_send,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                # Send invisible message to update the sticky keyboard
+                await message.reply_text("\u200b", reply_markup=get_reply_keyboard(count))
+            except Exception:
+                # Fallback if message was deleted
+                msg = await message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=get_reply_keyboard(count))
+                user_status_msg[user.id] = msg.message_id
+        else:
+            # First upload, send new message with keyboard
+            msg = await message.reply_text(
+                text_to_send,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=get_reply_keyboard(count)
+            )
+            user_status_msg[user.id] = msg.message_id
 
 
 # 🚀 Sticky Keyboard Handlers
@@ -1229,10 +1230,10 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     }
     
     now = now_bd().isoformat()
-    for doc in docs:
+    for i, doc in enumerate(docs, start=1):
         task_row = await db_fetchone(
-            "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
-            [user_id, message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now]
+            "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at, position) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?) RETURNING id",
+            [user_id, message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now, i]
         )
         if task_row:
             await conversion_queue.put(task_row["id"])
