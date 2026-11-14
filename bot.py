@@ -83,8 +83,8 @@ SUPPORTED_EXTENSIONS = {
 }
 
 # 🚀 Memory Limits to prevent Render Server Crash (OOM)
-MAX_DIMENSION = 4096
-Image.MAX_IMAGE_PIXELS = None # Allow large images, we will resize manually
+MAX_DIMENSION = 2048 # 🚀 Reduced to 2048 for 512MB RAM safety
+Image.MAX_IMAGE_PIXELS = None
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
@@ -635,7 +635,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (Memory Safe & HEIC Scaled)
+# IMAGE CONVERSION LOGIC (Memory Safe & HEIC Scaled with max_size)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -651,17 +651,23 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
-            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            w, h = heif.size
-            
-            # 🚀 FIXED: Downscale before to_pillow() to prevent OOM on 108MP+ images
-            if w > MAX_DIMENSION or h > MAX_DIMENSION:
-                ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+            # 🚀 Use options={"max_size": ...} to downscale DURING decoding. 
+            # This prevents the 108MP image from ever fully entering memory.
+            try:
+                heif = pillow_heif.open_heif(
+                    str(input_file), 
+                    convert_hdr_to_8bit=True,
+                    options={"max_size": (MAX_DIMENSION, MAX_DIMENSION)}
+                )
+            except TypeError:
+                # Fallback for older pillow_heif versions
+                heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
                 if hasattr(heif, 'scale'):
-                    heif.scale(ratio) # Modifies in-place
-                else:
-                    logger.warning("heif.scale() not available. Memory crash might occur.")
-                    
+                    w, h = heif.size
+                    ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+                    if ratio < 1:
+                        heif.scale(ratio)
+                        
             image = heif.to_pillow()
         else:
             image = Image.open(input_file)
