@@ -84,12 +84,12 @@ SUPPORTED_EXTENSIONS = {
 
 # 🚀 Memory Limits to prevent Render Server Crash (OOM)
 MAX_DIMENSION = 4096
-Image.MAX_IMAGE_PIXELS = 60000000 # 60 Megapixels (Prevents decompression bomb crash)
+Image.MAX_IMAGE_PIXELS = None # Allow large images, we will resize manually
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Limits & Retries (Exactly as you requested)
+# 🚀 Limits & Retries
 MAX_RETRIES = 5
 MAX_BATCH_SIZE = 1000 
 
@@ -635,7 +635,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (Memory Safe)
+# IMAGE CONVERSION LOGIC (Memory Safe & HEIC Scaled)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -648,14 +648,25 @@ def safe_unlink(path: Path) -> None:
 
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     image = None
+    heif = None
     try:
-        # 🚀 Using Pillow directly since register_heif_opener() is called. 
-        # It is generally more memory efficient than manual pillow_heif calls.
-        image = Image.open(input_file)
-        try:
-            image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
-        except Exception:
-            pass
+        if input_file.suffix.lower() in {".heic", ".heif"}:
+            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
+            w, h = heif.size
+            
+            # 🚀 FIXED: Downscale before to_pillow() to prevent OOM on 108MP+ images
+            if w > MAX_DIMENSION or h > MAX_DIMENSION:
+                ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+                if hasattr(heif, 'scale'):
+                    heif.scale(ratio) # Modifies in-place
+                else:
+                    logger.warning("heif.scale() not available. Memory crash might occur.")
+                    
+            image = heif.to_pillow()
+        else:
+            image = Image.open(input_file)
+            try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+            except: pass
 
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
@@ -668,6 +679,7 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
             image = image.convert("RGB")
 
         image.save(output_file, format="JPEG", quality=quality, optimize=True)
+        
     except (UnidentifiedImageError, OSError) as e:
         raise ConversionError(f"Corrupt or unreadable image file: {e}")
     except Exception as e:
@@ -676,6 +688,8 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
         if image is not None:
             image.close()
             del image
+        if heif is not None:
+            del heif
         gc.collect()
 
 
