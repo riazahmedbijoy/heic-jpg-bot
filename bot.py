@@ -86,8 +86,9 @@ MAX_DIMENSION = 4096
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Auto-retries before asking user for retry/skip decision
+# 🚀 Limits & Retries
 MAX_RETRIES = 3
+MAX_BATCH_SIZE = 50  # Prevent server OOM and massive queues
 
 # 🚀 In-memory state
 user_uploads: dict[int, list[dict]] = {}
@@ -386,10 +387,11 @@ async def _replace_floating_keyboard(bot, user_id: int, chat_id: int, completed:
     except Exception as e:
         logger.warning(f"Keyboard replace failed: {e}")
 
-async def update_progress_display(bot, user_id: int, chat_id: int):
+async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_update: bool = False):
     batch = user_batches.get(user_id)
     if not batch: return
     counts = await _get_batch_counts(user_id)
+    
     text = (
         f"🚀 *Converting files...*\n\n"
         f"📦 Total: *{counts['total']}*\n"
@@ -405,13 +407,18 @@ async def update_progress_display(bot, user_id: int, chat_id: int):
         pass # Ignore "message is not modified"
     except Exception:
         pass
-    await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"])
+
+    # 🚀 Only update floating keyboard every 5 files to prevent flood limits
+    last_kb_update = batch.get("last_kb_update", -1)
+    current = counts["success"] + counts["failed"]
+    if force_kb_update or (current - last_kb_update >= 5):
+        batch["last_kb_update"] = current
+        await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"])
 
 async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, error_msg: str):
     batch = user_batches.get(user_id)
     if not batch: return
     counts = await _get_batch_counts(user_id)
-    # Escape markdown characters in error messages just in case
     safe_err = str(error_msg).replace('`', '').replace('*', '').replace('_', ' ')
     safe_fn = str(task['filename']).replace('`', '')
     
@@ -476,8 +483,15 @@ async def process_single_task(bot, task: dict) -> dict:
     out_name = Path(filename).with_suffix(".jpg").name
 
     try:
-        tg_file = await bot.get_file(file_id)
-        await tg_file.download_to_drive(input_file)
+        # 🚀 Handle Flood Limit on Download
+        while True:
+            try:
+                tg_file = await bot.get_file(file_id)
+                await tg_file.download_to_drive(input_file)
+                break
+            except telegram.error.RetryAfter as e:
+                logger.warning(f"Flood limit on download, waiting {e.retry_after}s")
+                await asyncio.sleep(e.retry_after)
 
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
@@ -487,18 +501,23 @@ async def process_single_task(bot, task: dict) -> dict:
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
 
+        # 🚀 Handle Flood Limit on Upload
         with output_file.open("rb") as jpg_file:
-            sent = await bot.send_document(
-                chat_id=chat_id, document=jpg_file, filename=out_name,
-                caption=f"✅ Conversion complete! Position {position}\n📄 `{out_name}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            while True:
+                try:
+                    sent = await bot.send_document(
+                        chat_id=chat_id, document=jpg_file, filename=out_name,
+                        caption=f"✅ Conversion complete! Position {position}\n📄 `{out_name}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    break
+                except telegram.error.RetryAfter as e:
+                    logger.warning(f"Flood limit on send, waiting {e.retry_after}s")
+                    await asyncio.sleep(e.retry_after)
+
         conv_id = sent.document.file_id if sent.document else None
         return {"status": "success", "conv_id": conv_id}
 
-    except telegram.error.RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        return {"status": "failed", "error": f"Flood limit (retry after {e.retry_after}s)"}
     except Exception as e:
         logger.error(f"Task {task['id']} failed: {e}")
         return {"status": "failed", "error": str(e)[:200]}
@@ -592,6 +611,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
         user_batches[user_id] = {
             "total": counts["total"], "status_msg_id": status_msg.message_id,
             "kb_msg_id": kb_msg.message_id, "chat_id": chat_id,
+            "last_kb_update": counts["success"] + counts["failed"]
         }
     except Exception: return
 
@@ -603,7 +623,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (🚀 FIXED HEIC SCALE ERROR)
+# IMAGE CONVERSION LOGIC
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -619,14 +639,12 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
             heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            # 🚀 FIXED: HeifFile doesn't have .scale(), we convert to Pillow Image first
             image = heif.to_pillow()
         else:
             image = Image.open(input_file)
             try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
             except: pass
 
-        # 🚀 Resize safely using Pillow's thumbnail
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
@@ -914,6 +932,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if user.id not in user_uploads:
             user_uploads[user.id] = []
 
+        if len(user_uploads[user.id]) >= MAX_BATCH_SIZE:
+            await message.reply_text(
+                f"⚠️ You have reached the maximum limit of {MAX_BATCH_SIZE} files per batch.\n"
+                "Please tap '✅ Done - Start Conversion' to process these files.",
+                reply_markup=get_upload_keyboard(len(user_uploads[user.id]))
+            )
+            return
+
         user_uploads[user.id].append({
             "file_id": document.file_id,
             "filename": filename,
@@ -990,6 +1016,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
         "status_msg_id": status_msg.message_id,
         "kb_msg_id": kb_msg.message_id,
         "chat_id": message.chat_id,
+        "last_kb_update": 0
     }
 
     spawn(process_user_queue(context.bot, user_id, message.chat_id))
@@ -1008,19 +1035,25 @@ async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message, user = update.message, update.effective_user
+    message = update.message or update.callback_query.message
+    user = update.effective_user
     if not user: return
     user_id = user.id
     chat_id = message.chat_id
 
     cancelled_users.add(user_id)
     await db_execute(
-        "UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status IN ('pending','awaiting_retry')",
+        "UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ?",
         [user_id]
     )
 
     if user_id not in active_processing:
         await finish_batch(context.bot, user_id, chat_id, cancelled=True)
+    else:
+        if update.callback_query:
+            await update.callback_query.answer("Stopping after current file...")
+        else:
+            await message.reply_text("⏳ Stopping after current file...")
 
 
 async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1045,8 +1078,7 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         [task["id"]]
     )
     
-    # 🚀 Immediately update UI to show it's processing again
-    await update_progress_display(context.bot, user_id, chat_id)
+    await update_progress_display(context.bot, user_id, chat_id, force_kb_update=True)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
@@ -1070,8 +1102,7 @@ async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
     spawn(record_conversion(user_id, task["filename"], "failed", task["source"], task["file_size"], None, task["file_id"]))
     
-    # 🚀 Immediately update UI
-    await update_progress_display(context.bot, user_id, chat_id)
+    await update_progress_display(context.bot, user_id, chat_id, force_kb_update=True)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
@@ -1260,6 +1291,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel", handle_cancel_conversion))
 
     # Callback Handlers
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
