@@ -82,13 +82,16 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
+# 🚀 Memory Limits to prevent Render Server Crash (OOM)
 MAX_DIMENSION = 4096
+Image.MAX_IMAGE_PIXELS = 60000000 # 60 Megapixels (Prevents decompression bomb crash)
+
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Limits & Retries
-MAX_RETRIES = 3
-MAX_BATCH_SIZE = 1000  # 🚀 বড় বাল্ক আপলোডের জন্য লিমিট বাড়ানো হলো (১০০০ ফাইল)
+# 🚀 Limits & Retries (Exactly as you requested)
+MAX_RETRIES = 5
+MAX_BATCH_SIZE = 1000 
 
 # 🚀 In-memory state
 user_uploads: dict[int, list[dict]] = {}
@@ -101,7 +104,6 @@ active_processing: set[int] = set()   # user_ids currently being processed
 # INITIALIZATION
 # ===========================================================================
 pillow_heif.register_heif_opener()
-Image.MAX_IMAGE_PIXELS = None
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -209,6 +211,12 @@ async def init_database() -> None:
     await db_execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, payload TEXT, stars INTEGER, charge_id TEXT UNIQUE, created_at TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, status TEXT, quota_source TEXT, file_size INTEGER, created_at TEXT, converted_file_id TEXT, original_file_id TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
+    
+    # 🚀 Add crash_count column for detecting server OOM crashes
+    try:
+        await db_execute("ALTER TABLE pending_tasks ADD COLUMN crash_count INTEGER DEFAULT 0")
+    except:
+        pass
 
 
 # ===========================================================================
@@ -403,11 +411,10 @@ async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_upda
             text=text, parse_mode=ParseMode.MARKDOWN,
         )
     except telegram.error.BadRequest:
-        pass # Ignore "message is not modified"
+        pass 
     except Exception:
         pass
 
-    # 🚀 Only update floating keyboard every 5 files to prevent flood limits
     last_kb_update = batch.get("last_kb_update", -1)
     current = counts["success"] + counts["failed"]
     if force_kb_update or (current - last_kb_update >= 5):
@@ -482,14 +489,12 @@ async def process_single_task(bot, task: dict) -> dict:
     out_name = Path(filename).with_suffix(".jpg").name
 
     try:
-        # 🚀 Handle Flood Limit on Download
         while True:
             try:
                 tg_file = await bot.get_file(file_id)
                 await tg_file.download_to_drive(input_file)
                 break
             except telegram.error.RetryAfter as e:
-                logger.warning(f"Flood limit on download, waiting {e.retry_after}s")
                 await asyncio.sleep(e.retry_after)
 
         if user_id in cancelled_users:
@@ -500,7 +505,6 @@ async def process_single_task(bot, task: dict) -> dict:
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
 
-        # 🚀 Handle Flood Limit on Upload
         with output_file.open("rb") as jpg_file:
             while True:
                 try:
@@ -511,7 +515,6 @@ async def process_single_task(bot, task: dict) -> dict:
                     )
                     break
                 except telegram.error.RetryAfter as e:
-                    logger.warning(f"Flood limit on send, waiting {e.retry_after}s")
                     await asyncio.sleep(e.retry_after)
 
         conv_id = sent.document.file_id if sent.document else None
@@ -546,10 +549,18 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id)
                 return
 
+            # 🚀 Check if this file crashed the server 5 times
+            if task.get("crash_count", 0) >= MAX_RETRIES:
+                await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
+                await show_retry_skip_prompt(bot, user_id, chat_id, task, f"Server crashed {task['crash_count']} times while processing this file. It might be too large or corrupted.")
+                return
+
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task["id"]])
 
             result = None
-            attempt = 0
+            attempt = task.get("retry_count", 0)
+            
+            # 🚀 Auto Retry Loop (5 times)
             while attempt < MAX_RETRIES:
                 if user_id in cancelled_users:
                     result = {"status": "cancelled", "error": "User cancelled"}
@@ -579,9 +590,9 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id, cancelled=True)
                 return
 
-            # Failed after auto-retries → prompt user
+            # Failed after 5 auto-retries → prompt user
             await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
-            await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Unknown error"))
+            await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Failed after max retries"))
             return
 
     except Exception as e:
@@ -593,7 +604,9 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
 
 
 async def resume_user_processing(bot, user_id: int, chat_id: int):
-    await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE user_id = ? AND status = 'processing'", [user_id])
+    # 🚀 Any task that was 'processing' means the server crashed
+    await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE user_id = ? AND status = 'processing'", [user_id])
+    
     counts = await _get_batch_counts(user_id)
     if counts["total"] == 0: return
 
@@ -622,7 +635,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC
+# IMAGE CONVERSION LOGIC (Memory Safe)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -636,13 +649,13 @@ def safe_unlink(path: Path) -> None:
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
     image = None
     try:
-        if input_file.suffix.lower() in {".heic", ".heif"}:
-            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            image = heif.to_pillow()
-        else:
-            image = Image.open(input_file)
-            try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
-            except: pass
+        # 🚀 Using Pillow directly since register_heif_opener() is called. 
+        # It is generally more memory efficient than manual pillow_heif calls.
+        image = Image.open(input_file)
+        try:
+            image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+        except Exception:
+            pass
 
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
@@ -655,12 +668,14 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
             image = image.convert("RGB")
 
         image.save(output_file, format="JPEG", quality=quality, optimize=True)
+    except (UnidentifiedImageError, OSError) as e:
+        raise ConversionError(f"Corrupt or unreadable image file: {e}")
+    except Exception as e:
+        raise ConversionError(f"Image processing failed: {e}")
     finally:
         if image is not None:
             image.close()
             del image
-        if 'heif' in locals():
-            del heif
         gc.collect()
 
 
@@ -936,7 +951,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user_uploads[user.id] = []
 
         if len(user_uploads[user.id]) >= MAX_BATCH_SIZE:
-            # 🚀 Send warning ONLY ONCE instead of spamming on every file
             if not context.user_data.get("limit_warned"):
                 context.user_data["limit_warned"] = True
                 await message.reply_text(
@@ -977,7 +991,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user: return
 
     user_id = user.id
-    context.user_data.pop("limit_warned", None) # Reset warning flag
+    context.user_data.pop("limit_warned", None)
 
     if user_id in active_processing or user_id in user_batches:
         await message.reply_text(
@@ -1050,7 +1064,7 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
     chat_id = message.chat_id
 
     if user_id in cancelled_users:
-        return # 🚀 Prevent spam if already cancelling
+        return
 
     cancelled_users.add(user_id)
     await db_execute(
@@ -1084,8 +1098,9 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("✅ No failed file to retry.", reply_markup=get_main_keyboard(user_id))
         return
 
+    # 🚀 Reset BOTH retry_count and crash_count so it gets another 5 attempts
     await db_execute(
-        "UPDATE pending_tasks SET status = 'pending', retry_count = 0 WHERE id = ?",
+        "UPDATE pending_tasks SET status = 'pending', retry_count = 0, crash_count = 0 WHERE id = ?",
         [task["id"]]
     )
     
@@ -1264,7 +1279,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
 
-    await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE status = 'processing'")
+    # Increment crash count for tasks that were processing (meaning server crashed)
+    await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
         "SELECT user_id, chat_id FROM pending_tasks "
