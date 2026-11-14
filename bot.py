@@ -11,6 +11,7 @@ import math
 import os
 import threading
 import gc
+import subprocess  # 🚀 Added for memory-efficient image conversion
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -210,9 +211,11 @@ async def init_database() -> None:
     await db_execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_date TEXT, free_used INTEGER DEFAULT 0, paid_credits INTEGER DEFAULT 0, unlimited_until TEXT, registered_at TEXT, last_seen_at TEXT, total_conversions INTEGER DEFAULT 0, successful_conversions INTEGER DEFAULT 0, failed_conversions INTEGER DEFAULT 0)")
     await db_execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, payload TEXT, stars INTEGER, charge_id TEXT UNIQUE, created_at TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, status TEXT, quota_source TEXT, file_size INTEGER, created_at TEXT, converted_file_id TEXT, original_file_id TEXT)")
-    await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
     
-    # 🚀 Add crash_count column for detecting server OOM crashes
+    # 🚀 Add crash_count column directly to table creation
+    await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, crash_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
+    
+    # 🚀 Add crash_count for existing databases
     try:
         await db_execute("ALTER TABLE pending_tasks ADD COLUMN crash_count INTEGER DEFAULT 0")
     except:
@@ -423,7 +426,6 @@ async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_upda
 
 async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, error_msg: str):
     batch = user_batches.get(user_id)
-    if not batch: return
     counts = await _get_batch_counts(user_id)
     safe_err = str(error_msg).replace('`', '').replace('*', '').replace('_', ' ')
     safe_fn = str(task['filename']).replace('`', '')
@@ -435,16 +437,29 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
         f"📊 Progress: *{counts['success']}/{counts['total']}*\n\n"
         f"👇 *Retry the file or skip it?*"
     )
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=batch["status_msg_id"],
-            text=text, parse_mode=ParseMode.MARKDOWN,
-        )
-    except telegram.error.BadRequest:
-        pass
-    except Exception:
-        pass
-    await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"], retry_skip=True)
+
+    # 🚀 If server restarted, user_batches will be missing. Create it!
+    if not batch:
+        try:
+            status_msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+            kb_msg = await bot.send_message(
+                chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}",
+                reply_markup=get_retry_skip_keyboard(counts["success"], counts["total"])
+            )
+            user_batches[user_id] = {
+                "total": counts["total"], "status_msg_id": status_msg.message_id,
+                "kb_msg_id": kb_msg.message_id, "chat_id": chat_id,
+                "last_kb_update": counts["success"] + counts["failed"]
+            }
+        except Exception: pass
+    else:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=batch["status_msg_id"],
+                text=text, parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception: pass
+        await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"], retry_skip=True)
 
 async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False):
     batch = user_batches.pop(user_id, None)
@@ -604,9 +619,7 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
 
 
 async def resume_user_processing(bot, user_id: int, chat_id: int):
-    # 🚀 Any task that was 'processing' means the server crashed
-    await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE user_id = ? AND status = 'processing'", [user_id])
-    
+    # 🚀 Any task that was 'processing' means the server crashed (incremented in on_startup)
     counts = await _get_batch_counts(user_id)
     if counts["total"] == 0: return
 
@@ -635,7 +648,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (Memory Safe & HEIC Scaled with max_size)
+# IMAGE CONVERSION LOGIC (Memory Safe with FFmpeg Fallback)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -647,27 +660,51 @@ def safe_unlink(path: Path) -> None:
     except: pass
 
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
+    # 🚀 1. Try FFmpeg first (handles 108MP HEIC files gracefully without OOM)
+    if input_file.suffix.lower() in {".heic", ".heif"}:
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(input_file),
+                    "-vf", f"scale='min({MAX_DIMENSION},iw)':'min({MAX_DIMENSION},ih)':force_original_aspect_ratio=decrease",
+                    "-q:v", "2", str(output_file)
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+            )
+            if output_file.exists() and output_file.stat().st_size > 0:
+                return  # FFmpeg succeeded!
+        except Exception as e:
+            logger.warning(f"FFmpeg failed or not installed. Falling back to Pillow: {e}")
+
+    # 🚀 2. Fallback to Pillow
     image = None
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
-            # 🚀 Use options={"max_size": ...} to downscale DURING decoding. 
-            # This prevents the 108MP image from ever fully entering memory.
             try:
+                # pillow_heif >= 0.16.0
                 heif = pillow_heif.open_heif(
-                    str(input_file), 
+                    str(input_file),
                     convert_hdr_to_8bit=True,
                     options={"max_size": (MAX_DIMENSION, MAX_DIMENSION)}
                 )
             except TypeError:
-                # Fallback for older pillow_heif versions
-                heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-                if hasattr(heif, 'scale'):
+                try:
+                    # pillow_heif < 0.16.0
+                    heif = pillow_heif.open_heif(
+                        str(input_file),
+                        convert_hdr_to_8bit=True,
+                        size=(MAX_DIMENSION, MAX_DIMENSION)
+                    )
+                except TypeError:
+                    heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
                     w, h = heif.size
-                    ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
-                    if ratio < 1:
-                        heif.scale(ratio)
-                        
+                    if w > MAX_DIMENSION or h > MAX_DIMENSION:
+                        ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+                        if hasattr(heif, 'scale'):
+                            heif.scale(ratio)
+                        else:
+                            raise ConversionError("Your pillow_heif version is too old to downscale large HEIC files safely. Please ask the admin to run 'pip install --upgrade pillow_heif'.")
             image = heif.to_pillow()
         else:
             image = Image.open(input_file)
@@ -685,7 +722,6 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
             image = image.convert("RGB")
 
         image.save(output_file, format="JPEG", quality=quality, optimize=True)
-        
     except (UnidentifiedImageError, OSError) as e:
         raise ConversionError(f"Corrupt or unreadable image file: {e}")
     except Exception as e:
@@ -1299,7 +1335,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
 
-    # Increment crash count for tasks that were processing (meaning server crashed)
+    # 🚀 Increment crash count for tasks that were processing (meaning server crashed)
     await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
