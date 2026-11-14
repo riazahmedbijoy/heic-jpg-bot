@@ -357,20 +357,25 @@ async def update_progress_ui(bot, batch, text, kb_markup=None):
     except Exception:
         pass
 
-    # 2. Update floating keyboard (Only if markup is provided)
+    # 2. Update floating keyboard
     if kb_markup:
         try:
-            new_kb = await bot.send_message(
+            await bot.edit_message_text(
                 chat_id=batch["chat_id"],
-                text=" ",
+                message_id=batch["kb_msg_id"],
+                text=f"🔄 Converting... ({batch['completed']}/{batch['total']})",
                 reply_markup=kb_markup
             )
-            if "kb_msg_id" in batch and batch["kb_msg_id"]:
-                try: await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
-                except: pass
-            batch["kb_msg_id"] = new_kb.message_id
         except Exception:
-            pass
+            # Fallback if message was deleted
+            try:
+                new_kb = await bot.send_message(
+                    chat_id=batch["chat_id"],
+                    text=f"🔄 Converting... ({batch['completed']}/{batch['total']})",
+                    reply_markup=kb_markup
+                )
+                batch["kb_msg_id"] = new_kb.message_id
+            except: pass
 
 async def process_serial_queue(application: Application):
     bot = application.bot
@@ -378,27 +383,27 @@ async def process_serial_queue(application: Application):
     
     while True:
         try:
-            # 1. Find any user with pending tasks
-            user_row = await db_fetchone("SELECT DISTINCT user_id FROM pending_tasks WHERE status IN ('pending', 'processing', 'waiting_user') LIMIT 1")
+            # Find a user who has pending tasks but NO waiting_user tasks
+            user_row = await db_fetchone("""
+                SELECT DISTINCT user_id FROM pending_tasks 
+                WHERE status = 'pending' 
+                AND user_id NOT IN (SELECT user_id FROM pending_tasks WHERE status = 'waiting_user')
+                LIMIT 1
+            """)
+            
             if not user_row:
                 await asyncio.sleep(2)
                 continue
                 
             user_id = user_row["user_id"]
             
-            # 2. Fetch the NEXT task based on Position (Strictly Serial)
+            # Fetch the NEXT task for this user
             task = await db_fetchone(
-                "SELECT * FROM pending_tasks WHERE user_id = ? AND status IN ('pending', 'processing', 'waiting_user') ORDER BY position ASC LIMIT 1",
+                "SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'pending' ORDER BY position ASC LIMIT 1",
                 [user_id]
             )
-            
             if not task:
                 await asyncio.sleep(1)
-                continue
-
-            # 3. Check if waiting for user action (Retry/Skip)
-            if task["status"] == "waiting_user":
-                await asyncio.sleep(2)
                 continue
 
             # 4. Process Task
@@ -416,8 +421,7 @@ async def process_serial_queue(application: Application):
             success, conv_id, error_msg = False, None, ""
 
             try:
-                if user_id in cancelled_users:
-                    raise Exception("Cancelled by user")
+                if user_id in cancelled_users: raise Exception("Cancelled by user")
 
                 tg_file = await bot.get_file(file_id)
                 await tg_file.download_to_drive(input_file)
@@ -793,7 +797,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         })
         count = len(user_uploads[user.id])
 
-        text = f"📥 `{filename}`"
+        text = f"📥 `{filename}`\n\n📦 Total: *{count}*"
         
         msg = await message.reply_text(
             text,
@@ -894,7 +898,7 @@ async def handle_retry_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         batch = user_batches.get(user_id)
         if batch:
-            text = f"🔄 *Retrying:* `{task['id']}`...\n\n📦 Total: *{batch['total']}*\n✅ Completed: *{batch['completed']}*"
+            text = f"🔄 *Retrying...*\n\n📦 Total: *{batch['total']}*\n✅ Completed: *{batch['completed']}*"
             await update_progress_ui(context.bot, batch, text, get_processing_keyboard(batch["completed"], batch["total"]))
 
 async def handle_skip_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1072,21 +1076,19 @@ async def on_startup(application: Application) -> None:
         
     for uid, tasks in user_pending.items():
         chat_id = tasks[0]["chat_id"]
-        # Count how many are already done
-        completed = await db_fetchone("SELECT COUNT(*) AS c FROM conversions WHERE user_id = ?", [uid])
-        
-        # Just a basic reconstruct
-        total = len(tasks) + (completed["c"] if completed else 0)
+        total = len(tasks)
+        has_waiting = any(t["status"] == "waiting_user" for t in tasks)
+        kb = get_failed_keyboard() if has_waiting else get_processing_keyboard(0, total)
         
         try:
             msg = await application.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔄 *Bot restarted. Resuming pending files...*\n\n✅ Completed: *0 / {total}*",
+                text=f"🔄 *Bot restarted. Resuming {total} pending files...*\n\n✅ Completed: *0 / {total}*",
                 parse_mode=ParseMode.MARKDOWN
             )
-            kb_msg = await application.bot.send_message(chat_id=chat_id, text=" ", reply_markup=get_processing_keyboard(0, total))
+            kb_msg = await application.bot.send_message(chat_id=chat_id, text=" ", reply_markup=kb)
             user_batches[uid] = {
-                "total": total, "completed": completed["c"] if completed else 0, "failed": 0,
+                "total": total, "completed": 0, "failed": 0,
                 "status_msg_id": msg.message_id, "kb_msg_id": kb_msg.message_id,
                 "chat_id": chat_id, "active": True
             }
