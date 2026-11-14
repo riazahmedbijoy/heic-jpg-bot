@@ -399,7 +399,7 @@ async def queue_worker(application: Application, worker_id: int):
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
                     batch["completed"] += 1
-                    text = f"🔄 *Conversion in Progress...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                    text = f"🚀 *Starting conversion...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                     
                     if batch["completed"] + batch["failed"] == batch["total"]:
                         text = f"🎉 *All {batch['total']} conversions completed!*"
@@ -409,30 +409,28 @@ async def queue_worker(application: Application, worker_id: int):
                         
                         try:
                             await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                            await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
                         except: pass
                         
-                        await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
+                        await bot.send_message(
+                            chat_id=batch["chat_id"], 
+                            text=text + "\n\n👇 Use the menu below.", 
+                            parse_mode=ParseMode.MARKDOWN, 
+                            reply_markup=get_main_keyboard(user_id)
+                        )
                         conversion_queue.task_done()
                         continue
 
-                    # Update Text
+                    # 🚀 FIXED: Update both text and keyboard cleanly
                     try:
-                        await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                        await bot.edit_message_text(
+                            chat_id=batch["chat_id"], 
+                            message_id=batch["status_msg_id"], 
+                            text=text, 
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
+                        )
                     except: pass
-                    
-                    # Update Keyboard (Every 5 files or at the end)
-                    if batch["completed"] % 5 == 0 or (batch["completed"] + batch["failed"] == batch["total"]):
-                        try:
-                            new_kb_msg = await bot.send_message(
-                                chat_id=batch["chat_id"], 
-                                text="\u200b", 
-                                reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
-                            )
-                            try: await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
-                            except: pass
-                            batch["kb_msg_id"] = new_kb_msg.message_id
-                        except: pass
+
             else:
                 if error_msg == "Cancelled by user":
                     await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
@@ -449,7 +447,8 @@ async def queue_worker(application: Application, worker_id: int):
                         batch = user_batches.get(user_id)
                         if batch and batch.get("active"):
                             batch["failed"] += 1
-                            text = f"🔄 *Conversion in Progress...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                            text = f"🚀 *Starting conversion...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                            
                             if batch["completed"] + batch["failed"] == batch["total"]:
                                 text = f"🎉 *All {batch['total']} conversions completed!*"
                                 if batch["failed"] > 0: text += f"\n⚠️ *Failed: {batch['failed']}*"
@@ -457,13 +456,24 @@ async def queue_worker(application: Application, worker_id: int):
                                 del user_batches[user_id]
                                 try:
                                     await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                                    await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
                                 except: pass
-                                await bot.send_message(chat_id=batch["chat_id"], text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
+                                await bot.send_message(
+                                    chat_id=batch["chat_id"], 
+                                    text=text + "\n\n👇 Use the menu below.", 
+                                    parse_mode=ParseMode.MARKDOWN, 
+                                    reply_markup=get_main_keyboard(user_id)
+                                )
                                 conversion_queue.task_done()
                                 continue
+                            
                             try:
-                                await bot.edit_message_text(chat_id=batch["chat_id"], message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
+                                await bot.edit_message_text(
+                                    chat_id=batch["chat_id"], 
+                                    message_id=batch["status_msg_id"], 
+                                    text=text, 
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
+                                )
                             except: pass
 
             safe_unlink(input_file)
@@ -770,18 +780,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         })
         count = len(user_uploads[user.id])
 
-        # 🚀 FIXED: Send new message first, then delete old one to prevent keyboard flickering
-        msg = await message.reply_text(
-            f"📥 `{filename}`", 
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_upload_keyboard(count)
-        )
+        text = f"📥 `{filename}`"
         
+        # 🚀 FIXED: Edit existing message instead of deleting and sending new one to prevent flickering
         if "last_status_msg" in context.user_data:
-            try: await context.bot.delete_message(chat_id=message.chat_id, message_id=context.user_data["last_status_msg"])
-            except: pass
-
-        context.user_data["last_status_msg"] = msg.message_id
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=context.user_data["last_status_msg"],
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_upload_keyboard(count)
+                )
+            except Exception:
+                # Fallback if message was deleted by user
+                msg = await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_upload_keyboard(count))
+                context.user_data["last_status_msg"] = msg.message_id
+        else:
+            msg = await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_upload_keyboard(count))
+            context.user_data["last_status_msg"] = msg.message_id
 
 
 # ===========================================================================
@@ -802,6 +819,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     user_uploads[user_id] = []
     cancelled_users.discard(user_id)
     
+    # Clean up the previous upload message
     if "last_status_msg" in context.user_data:
         try: await context.bot.delete_message(chat_id=message.chat_id, message_id=context.user_data["last_status_msg"])
         except: pass
@@ -816,7 +834,6 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     user_batches[user_id] = {
         "total": total, "completed": 0, "failed": 0,
         "status_msg_id": status_msg.message_id, 
-        "kb_msg_id": status_msg.message_id, # Store keyboard message ID separately
         "chat_id": message.chat_id, "active": True
     }
     
@@ -853,8 +870,6 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
     batch = user_batches.pop(user_id, None)
     if batch:
         try: await context.bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-        except: pass
-        try: await context.bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
         except: pass
         
     await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
@@ -1032,7 +1047,7 @@ def main() -> None:
         .write_timeout(300)
         .pool_timeout(60)
         .concurrent_updates(True)
-        .post_init(on_startup) # 🚀 FIXED: Using post_init
+        .post_init(on_startup) 
         .build()
     )
 
