@@ -88,7 +88,7 @@ CONVS_PER_PAGE = 8
 
 # 🚀 Concurrency
 MAX_WORKERS = 1  
-MAX_RETRIES = 3
+MAX_RETRIES = 5  # 🚀 Increased to prevent skipping
 conversion_queue = asyncio.Queue()
 
 # 🚀 State Tracking
@@ -350,19 +350,14 @@ async def update_progress(bot, batch, text):
     except Exception:
         pass
 
-    # 🚀 2. Update the floating keyboard via a visible message, then delete it
+    # 🚀 2. Update the floating keyboard via editing the keyboard message itself
     try:
-        new_kb = await bot.send_message(
+        await bot.edit_message_text(
             chat_id=batch["chat_id"],
-            text="🔄 Updating...", # FIXED: Non-empty text to prevent BadRequest
+            message_id=batch["kb_msg_id"],
+            text=f"🔄 Converting... ({batch['completed']}/{batch['total']})",
             reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
         )
-        if "kb_msg_id" in batch and batch["kb_msg_id"]:
-            try:
-                await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
-            except:
-                pass
-        batch["kb_msg_id"] = new_kb.message_id
     except Exception:
         pass
 
@@ -464,6 +459,7 @@ async def queue_worker(application: Application, worker_id: int):
                     else:
                         await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
                         spawn(record_conversion(user_id, filename, "failed", source, size, None, file_id))
+                        logger.error(f"❌ Worker {worker_id} permanently failed: {filename} - {error_msg}")
                         
                         batch = user_batches.get(user_id)
                         if batch and batch.get("active"):
@@ -490,7 +486,7 @@ async def queue_worker(application: Application, worker_id: int):
                             
                             await update_progress(bot, batch, text)
 
-            # 🚀 Force memory cleanup
+            # 🚀 Force memory cleanup to prevent RAM crash
             safe_unlink(input_file)
             safe_unlink(output_file)
             gc.collect() 
@@ -849,7 +845,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     
     # 🚀 Send keyboard as a separate visible message to keep it at the bottom
-    kb_msg = await message.reply_text("🔄 Updating...", reply_markup=get_processing_keyboard(0, total))
+    kb_msg = await message.reply_text(f"🔄 Converting... (0/{total})", reply_markup=get_processing_keyboard(0, total))
     
     user_batches[user_id] = {
         "total": total, "completed": 0, "failed": 0,
@@ -1046,9 +1042,41 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
     await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE status = 'processing'")
-    pending_tasks = await db_fetchall("SELECT id FROM pending_tasks WHERE status = 'pending' ORDER BY id ASC")
-    if pending_tasks:
-        for row in pending_tasks: await conversion_queue.put(row["id"])
+    pending_tasks = await db_fetchall("SELECT * FROM pending_tasks WHERE status = 'pending' ORDER BY id ASC")
+    
+    # 🚀 Reconstruct batches on restart to resume progress correctly
+    user_pending = {}
+    for task in pending_tasks:
+        uid = task["user_id"]
+        if uid not in user_pending:
+            user_pending[uid] = []
+        user_pending[uid].append(task)
+        
+    for uid, tasks in user_pending.items():
+        chat_id = tasks[0]["chat_id"]
+        total = len(tasks)
+        
+        try:
+            msg = await application.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔄 *Bot restarted. Resuming {total} pending files...*\n\n✅ Completed: *0 / {total}*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            kb_msg = await application.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔄 Converting... (0/{total})",
+                reply_markup=get_processing_keyboard(0, total)
+            )
+            user_batches[uid] = {
+                "total": total, "completed": 0, "failed": 0,
+                "status_msg_id": msg.message_id,
+                "kb_msg_id": kb_msg.message_id,
+                "chat_id": chat_id, "active": True
+            }
+        except: pass
+            
+        for row in tasks:
+            await conversion_queue.put(row["id"])
     
     for i in range(1, MAX_WORKERS + 1):
         asyncio.create_task(queue_worker(application, i))
