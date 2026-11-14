@@ -1,6 +1,6 @@
 """
-Image → JPG Telegram Bot with Turso (Complete Professional Edition)
-===================================================================
+Image → JPG Telegram Bot with Turso (Strict Serial + Retry/Skip UI)
+====================================================================
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# FLASK APP (Render Health Check)
+# FLASK APP
 # ===========================================================================
 flask_app = Flask(__name__)
 
@@ -86,10 +86,7 @@ MAX_DIMENSION = 4096
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Concurrency
-MAX_WORKERS = 1  
-MAX_RETRIES = 5  # 🚀 Increased to prevent skipping
-conversion_queue = asyncio.Queue()
+MAX_RETRIES = 3
 
 # 🚀 State Tracking
 user_uploads: dict[int, list[dict]] = {}
@@ -114,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# KEYBOARD BUILDERS (Floating Menus)
+# KEYBOARD BUILDERS
 # ===========================================================================
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
@@ -140,6 +137,16 @@ def get_processing_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboard
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(btn_text)],
+            [KeyboardButton("❌ Cancel Conversion")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+def get_failed_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🔄 Retry"), KeyboardButton("⏭ Skip")],
             [KeyboardButton("❌ Cancel Conversion")]
         ],
         resize_keyboard=True,
@@ -336,10 +343,10 @@ async def search_users(query: str, limit: int = 30) -> list[dict]:
     return await db_fetchall("SELECT * FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(COALESCE(first_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(username, '')) LIKE LOWER(?) ORDER BY last_seen_at DESC LIMIT ?", [like, like, like, limit])
 
 # ===========================================================================
-# 🚀 QUEUE WORKER LOGIC
+# 🚀 CORE WORKER LOGIC (STRICT SERIAL)
 # ===========================================================================
-async def update_progress(bot, batch, text):
-    # 🚀 1. Update the text message
+async def update_progress_ui(bot, batch, text, kb_markup=None):
+    # 1. Update text message
     try:
         await bot.edit_message_text(
             chat_id=batch["chat_id"],
@@ -350,37 +357,56 @@ async def update_progress(bot, batch, text):
     except Exception:
         pass
 
-    # 🚀 2. Update the floating keyboard via editing the keyboard message itself
-    try:
-        await bot.edit_message_text(
-            chat_id=batch["chat_id"],
-            message_id=batch["kb_msg_id"],
-            text=f"🔄 Converting... ({batch['completed']}/{batch['total']})",
-            reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
-        )
-    except Exception:
-        pass
+    # 2. Update floating keyboard (Only if markup is provided)
+    if kb_markup:
+        try:
+            new_kb = await bot.send_message(
+                chat_id=batch["chat_id"],
+                text=" ",
+                reply_markup=kb_markup
+            )
+            if "kb_msg_id" in batch and batch["kb_msg_id"]:
+                try: await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
+                except: pass
+            batch["kb_msg_id"] = new_kb.message_id
+        except Exception:
+            pass
 
-async def queue_worker(application: Application, worker_id: int):
+async def process_serial_queue(application: Application):
     bot = application.bot
+    logger.info("🚀 Serial Worker Started.")
+    
     while True:
         try:
-            task_id = await conversion_queue.get()
-            task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ? AND status IN ('pending', 'processing')", [task_id])
-            if not task or task["status"] == "cancelled":
-                conversion_queue.task_done()
+            # 1. Find any user with pending tasks
+            user_row = await db_fetchone("SELECT DISTINCT user_id FROM pending_tasks WHERE status IN ('pending', 'processing', 'waiting_user') LIMIT 1")
+            if not user_row:
+                await asyncio.sleep(2)
+                continue
+                
+            user_id = user_row["user_id"]
+            
+            # 2. Fetch the NEXT task based on Position (Strictly Serial)
+            task = await db_fetchone(
+                "SELECT * FROM pending_tasks WHERE user_id = ? AND status IN ('pending', 'processing', 'waiting_user') ORDER BY position ASC LIMIT 1",
+                [user_id]
+            )
+            
+            if not task:
+                await asyncio.sleep(1)
                 continue
 
-            user_id = task["user_id"]
-            if user_id in cancelled_users:
-                await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
-                conversion_queue.task_done()
+            # 3. Check if waiting for user action (Retry/Skip)
+            if task["status"] == "waiting_user":
+                await asyncio.sleep(2)
                 continue
 
+            # 4. Process Task
+            task_id, chat_id = task["id"], task["chat_id"]
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task_id])
 
-            file_id, filename, chat_id = task["file_id"], task["filename"], task["chat_id"]
-            source, size, retry_count, position = task["source"], task["file_size"], task["retry_count"], task.get("position", 1)
+            file_id, filename = task["file_id"], task["filename"]
+            source, size, retry_count, position = task["source"], task["file_size"], task["retry_count"], task["position"]
 
             ext = Path(filename).suffix.lower()
             unique_id = f"task_{task_id}"
@@ -390,14 +416,13 @@ async def queue_worker(application: Application, worker_id: int):
             success, conv_id, error_msg = False, None, ""
 
             try:
-                if user_id in cancelled_users: raise Exception("Cancelled by user")
+                if user_id in cancelled_users:
+                    raise Exception("Cancelled by user")
+
                 tg_file = await bot.get_file(file_id)
                 await tg_file.download_to_drive(input_file)
-
-                if user_id in cancelled_users: raise Exception("Cancelled by user")
                 await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
-
-                if user_id in cancelled_users: raise Exception("Cancelled by user")
+                
                 with output_file.open("rb") as jpg_file:
                     sent = await bot.send_document(
                         chat_id=chat_id, document=jpg_file, filename=out_name,
@@ -413,7 +438,7 @@ async def queue_worker(application: Application, worker_id: int):
             except Exception as e:
                 error_msg = str(e)
 
-            # Handle Results
+            # 5. Handle Results
             if success:
                 await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
                 spawn(consume_conversion(user_id, source))
@@ -422,89 +447,60 @@ async def queue_worker(application: Application, worker_id: int):
                 batch = user_batches.get(user_id)
                 if batch and batch.get("active"):
                     batch["completed"] += 1
-                    text = f"🚀 *Starting conversion...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
                     
-                    if batch["completed"] + batch["failed"] == batch["total"]:
-                        text = f"🎉 *All {batch['total']} conversions completed!*"
-                        if batch["failed"] > 0: text += f"\n⚠️ *Failed: {batch['failed']}*"
+                    # Check if all done
+                    remaining = await db_fetchone("SELECT COUNT(*) AS c FROM pending_tasks WHERE user_id = ?", [user_id])
+                    if remaining["c"] == 0:
+                        text = f"🎉 *All {batch['total']} conversions completed!*\n\n👇 Use the menu below."
                         batch["active"] = False
                         del user_batches[user_id]
                         
                         try:
-                            await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                            await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
+                            await bot.delete_message(chat_id=chat_id, message_id=batch["status_msg_id"])
+                            await bot.delete_message(chat_id=chat_id, message_id=batch["kb_msg_id"])
                         except: pass
                         
-                        await bot.send_message(
-                            chat_id=batch["chat_id"], 
-                            text=text + "\n\n👇 Use the menu below.", 
-                            parse_mode=ParseMode.MARKDOWN, 
-                            reply_markup=get_main_keyboard(user_id)
-                        )
-                        conversion_queue.task_done()
-                        continue
-
-                    # Update both text and keyboard cleanly
-                    await update_progress(bot, batch, text)
+                        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
+                    else:
+                        text = f"🚀 *Starting conversion...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
+                        await update_progress_ui(bot, batch, text, get_processing_keyboard(batch["completed"], batch["total"]))
 
             else:
-                if error_msg == "Cancelled by user":
+                # Task Failed -> Handle Retry or Skip UI
+                if user_id in cancelled_users or error_msg == "Cancelled by user":
                     await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task_id])
                 else:
-                    retry_count += 1
-                    if retry_count <= MAX_RETRIES:
-                        await db_execute("UPDATE pending_tasks SET retry_count = ?, status = 'pending' WHERE id = ?", [retry_count, task_id])
-                        await asyncio.sleep(2)
-                        await conversion_queue.put(task_id)
-                    else:
-                        await db_execute("UPDATE pending_tasks SET status = 'failed' WHERE id = ?", [task_id])
-                        spawn(record_conversion(user_id, filename, "failed", source, size, None, file_id))
-                        logger.error(f"❌ Worker {worker_id} permanently failed: {filename} - {error_msg}")
+                    new_retry = retry_count + 1
+                    if new_retry > MAX_RETRIES:
+                        # Max retries reached -> Wait for user
+                        await db_execute("UPDATE pending_tasks SET status = 'waiting_user', retry_count = ? WHERE id = ?", [new_retry, task_id])
                         
                         batch = user_batches.get(user_id)
-                        if batch and batch.get("active"):
-                            batch["failed"] += 1
-                            text = f"🚀 *Starting conversion...*\n\n📦 Total files: *{batch['total']}*\n✅ *Completed: {batch['completed']} / {batch['total']}*"
-                            
-                            if batch["completed"] + batch["failed"] == batch["total"]:
-                                text = f"🎉 *All {batch['total']} conversions completed!*"
-                                if batch["failed"] > 0: text += f"\n⚠️ *Failed: {batch['failed']}*"
-                                batch["active"] = False
-                                del user_batches[user_id]
-                                try:
-                                    await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["status_msg_id"])
-                                    await bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
-                                except: pass
-                                await bot.send_message(
-                                    chat_id=batch["chat_id"], 
-                                    text=text + "\n\n👇 Use the menu below.", 
-                                    parse_mode=ParseMode.MARKDOWN, 
-                                    reply_markup=get_main_keyboard(user_id)
-                                )
-                                conversion_queue.task_done()
-                                continue
-                            
-                            await update_progress(bot, batch, text)
+                        if batch:
+                            text = (
+                                f"⚠️ *Failed to convert:* `{out_name}`\n"
+                                f"❌ Error: `{error_msg[:50]}`\n\n"
+                                f"👇 Choose an action on the keyboard below."
+                            )
+                            await update_progress_ui(bot, batch, text, get_failed_keyboard())
+                    else:
+                        # Retry automatically (Serial)
+                        await db_execute("UPDATE pending_tasks SET status = 'pending', retry_count = ? WHERE id = ?", [new_retry, task_id])
+                        await asyncio.sleep(2)
 
-            # 🚀 Force memory cleanup to prevent RAM crash
             safe_unlink(input_file)
             safe_unlink(output_file)
-            gc.collect() 
+            gc.collect()
             await asyncio.sleep(1)
-            conversion_queue.task_done()
 
-        except asyncio.CancelledError: break
-        except Exception: await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Serial Worker Error: {e}")
+            await asyncio.sleep(5)
 
 
 # ===========================================================================
 # IMAGE CONVERSION LOGIC
 # ===========================================================================
-class ConversionError(Exception): pass
-
-def is_supported_file(filename: str) -> bool:
-    return Path(filename).suffix.lower() in SUPPORTED_EXTENSIONS
-
 def safe_unlink(path: Path) -> None:
     try: path.unlink(missing_ok=True)
     except: pass
@@ -535,7 +531,6 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 
         image.save(output_file, format="JPEG", quality=quality, optimize=True)
     finally:
-        # 🚀 Force memory free
         if image is not None:
             image.close()
             del image
@@ -800,7 +795,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         text = f"📥 `{filename}`"
         
-        # 🚀 Send new message first, then delete old one to prevent keyboard flickering
         msg = await message.reply_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
@@ -832,20 +826,17 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     user_uploads[user_id] = []
     cancelled_users.discard(user_id)
     
-    # Clean up the previous upload message
     if "last_status_msg" in context.user_data:
         try: await context.bot.delete_message(chat_id=message.chat_id, message_id=context.user_data["last_status_msg"])
         except: pass
         del context.user_data["last_status_msg"]
     
-    # 🚀 Send status text WITHOUT keyboard
     status_msg = await message.reply_text(
         f"🚀 *Starting conversion...*\n\n📦 Total files: *{total}*\n✅ Completed: *0 / {total}*",
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # 🚀 Send keyboard as a separate visible message to keep it at the bottom
-    kb_msg = await message.reply_text(f"🔄 Converting... (0/{total})", reply_markup=get_processing_keyboard(0, total))
+    kb_msg = await message.reply_text(" ", reply_markup=get_processing_keyboard(0, total))
     
     user_batches[user_id] = {
         "total": total, "completed": 0, "failed": 0,
@@ -856,12 +847,10 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     
     now = now_bd().isoformat()
     for i, doc in enumerate(docs, start=1):
-        task_row = await db_fetchone(
-            "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at, position) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?) RETURNING id",
+        await db_execute(
+            "INSERT INTO pending_tasks (user_id, chat_id, file_id, filename, file_size, source, status, created_at, position) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             [user_id, message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now, i]
         )
-        if task_row:
-            await conversion_queue.put(task_row["id"])
 
 async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
@@ -891,8 +880,38 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
         try: await context.bot.delete_message(chat_id=batch["chat_id"], message_id=batch["kb_msg_id"])
         except: pass
         
-    await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", [user_id])
+    await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status IN ('pending', 'waiting_user')", [user_id])
     await message.reply_text("✅ All processing stopped.", reply_markup=get_main_keyboard(user_id))
+
+async def handle_retry_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.message, update.effective_user
+    if not user: return
+    user_id = user.id
+    
+    task = await db_fetchone("SELECT id FROM pending_tasks WHERE user_id = ? AND status = 'waiting_user' ORDER BY position ASC LIMIT 1", [user_id])
+    if task:
+        await db_execute("UPDATE pending_tasks SET status = 'pending', retry_count = 0 WHERE id = ?", [task["id"]])
+        
+        batch = user_batches.get(user_id)
+        if batch:
+            text = f"🔄 *Retrying:* `{task['id']}`...\n\n📦 Total: *{batch['total']}*\n✅ Completed: *{batch['completed']}*"
+            await update_progress_ui(context.bot, batch, text, get_processing_keyboard(batch["completed"], batch["total"]))
+
+async def handle_skip_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.message, update.effective_user
+    if not user: return
+    user_id = user.id
+    
+    task = await db_fetchone("SELECT id, position FROM pending_tasks WHERE user_id = ? AND status = 'waiting_user' ORDER BY position ASC LIMIT 1", [user_id])
+    if task:
+        # Mark as skipped (failed) and remove
+        await db_execute("DELETE FROM pending_tasks WHERE id = ?", [task["id"]])
+        
+        batch = user_batches.get(user_id)
+        if batch:
+            batch["failed"] += 1
+            text = f"⏭ *Skipped:* Position {task['position']}\n\n📦 Total: *{batch['total']}*\n✅ Completed: *{batch['completed']}*"
+            await update_progress_ui(context.bot, batch, text, get_processing_keyboard(batch["completed"], batch["total"]))
 
 
 # ===========================================================================
@@ -1042,44 +1061,38 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
     await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE status = 'processing'")
-    pending_tasks = await db_fetchall("SELECT * FROM pending_tasks WHERE status = 'pending' ORDER BY id ASC")
+    pending_tasks = await db_fetchall("SELECT * FROM pending_tasks WHERE status IN ('pending', 'waiting_user') ORDER BY id ASC")
     
-    # 🚀 Reconstruct batches on restart to resume progress correctly
+    # Reconstruct batches on restart
     user_pending = {}
     for task in pending_tasks:
         uid = task["user_id"]
-        if uid not in user_pending:
-            user_pending[uid] = []
+        if uid not in user_pending: user_pending[uid] = []
         user_pending[uid].append(task)
         
     for uid, tasks in user_pending.items():
         chat_id = tasks[0]["chat_id"]
-        total = len(tasks)
+        # Count how many are already done
+        completed = await db_fetchone("SELECT COUNT(*) AS c FROM conversions WHERE user_id = ?", [uid])
+        
+        # Just a basic reconstruct
+        total = len(tasks) + (completed["c"] if completed else 0)
         
         try:
             msg = await application.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔄 *Bot restarted. Resuming {total} pending files...*\n\n✅ Completed: *0 / {total}*",
+                text=f"🔄 *Bot restarted. Resuming pending files...*\n\n✅ Completed: *0 / {total}*",
                 parse_mode=ParseMode.MARKDOWN
             )
-            kb_msg = await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"🔄 Converting... (0/{total})",
-                reply_markup=get_processing_keyboard(0, total)
-            )
+            kb_msg = await application.bot.send_message(chat_id=chat_id, text=" ", reply_markup=get_processing_keyboard(0, total))
             user_batches[uid] = {
-                "total": total, "completed": 0, "failed": 0,
-                "status_msg_id": msg.message_id,
-                "kb_msg_id": kb_msg.message_id,
+                "total": total, "completed": completed["c"] if completed else 0, "failed": 0,
+                "status_msg_id": msg.message_id, "kb_msg_id": kb_msg.message_id,
                 "chat_id": chat_id, "active": True
             }
         except: pass
             
-        for row in tasks:
-            await conversion_queue.put(row["id"])
-    
-    for i in range(1, MAX_WORKERS + 1):
-        asyncio.create_task(queue_worker(application, i))
+    asyncio.create_task(process_serial_queue(application))
 
 
 # ===========================================================================
@@ -1102,15 +1115,12 @@ def main() -> None:
         .build()
     )
 
-    # Command Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
     
-    # Callback Handlers
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
     
-    # Message Handlers (Keyboard & Text)
     application.add_handler(MessageHandler(filters.Regex(r"^👑 Admin Panel$"), admin_command))
     application.add_handler(MessageHandler(filters.Regex(r"^👥 All Users$"), admin_all_users_btn))
     application.add_handler(MessageHandler(filters.Regex(r"^🔍 Search User$"), admin_search_btn))
@@ -1119,6 +1129,8 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(r"^✅ Done - Start Conversion"), handle_done_keyboard))
     application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Upload$"), handle_cancel_upload))
     application.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel Conversion$"), handle_cancel_conversion))
+    application.add_handler(MessageHandler(filters.Regex(r"^🔄 Retry$"), handle_retry_btn))
+    application.add_handler(MessageHandler(filters.Regex(r"^⏭ Skip$"), handle_skip_btn))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_text))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
