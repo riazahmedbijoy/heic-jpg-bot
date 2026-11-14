@@ -349,7 +349,7 @@ async def search_users(query: str, limit: int = 30) -> list[dict]:
 
 
 # ===========================================================================
-# 🚀 SERIAL PER-USER PROCESSING (replaces asyncio.Queue / queue_worker)
+# 🚀 SERIAL PER-USER PROCESSING
 # ===========================================================================
 
 async def _get_batch_counts(user_id: int) -> dict:
@@ -367,18 +367,12 @@ async def _get_batch_counts(user_id: int) -> dict:
         "failed": row["failed"] if row else 0,
     }
 
-
 async def _replace_floating_keyboard(bot, user_id: int, chat_id: int, completed: int, total: int, retry_skip: bool = False):
-    """
-    Reply keyboard CANNOT be updated via edit_message_text — must send a new message.
-    Send new first (sets chat keyboard), then delete old. No flicker.
-    """
     batch = user_batches.get(user_id)
     if not batch:
         return
     try:
         kb_markup = get_retry_skip_keyboard(completed, total) if retry_skip else get_processing_keyboard(completed, total)
-        # Small visible text; deleted next update
         new_msg = await bot.send_message(
             chat_id=chat_id,
             text=f"📊 {completed}/{total}",
@@ -387,20 +381,15 @@ async def _replace_floating_keyboard(bot, user_id: int, chat_id: int, completed:
         old_id = batch.get("kb_msg_id")
         batch["kb_msg_id"] = new_msg.message_id
         if old_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=old_id)
-            except Exception:
-                pass
+            try: await bot.delete_message(chat_id=chat_id, message_id=old_id)
+            except Exception: pass
     except Exception as e:
         logger.warning(f"Keyboard replace failed: {e}")
 
-
 async def update_progress_display(bot, user_id: int, chat_id: int):
     batch = user_batches.get(user_id)
-    if not batch:
-        return
+    if not batch: return
     counts = await _get_batch_counts(user_id)
-    # Status text
     text = (
         f"🚀 *Converting files...*\n\n"
         f"📦 Total: *{counts['total']}*\n"
@@ -409,77 +398,65 @@ async def update_progress_display(bot, user_id: int, chat_id: int):
     )
     try:
         await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=batch["status_msg_id"],
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=chat_id, message_id=batch["status_msg_id"],
+            text=text, parse_mode=ParseMode.MARKDOWN,
         )
+    except telegram.error.BadRequest:
+        pass # Ignore "message is not modified"
     except Exception:
         pass
-    # Floating keyboard
     await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"])
-
 
 async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, error_msg: str):
     batch = user_batches.get(user_id)
-    if not batch:
-        return
+    if not batch: return
     counts = await _get_batch_counts(user_id)
+    # Escape markdown characters in error messages just in case
+    safe_err = str(error_msg).replace('`', '').replace('*', '').replace('_', ' ')
+    safe_fn = str(task['filename']).replace('`', '')
+    
     text = (
         f"⚠️ *Conversion failed!*\n\n"
-        f"📄 File: `{task['filename']}`\n"
-        f"❗ Error: `{error_msg}`\n\n"
+        f"📄 File: `{safe_fn}`\n"
+        f"❗ Error: `{safe_err}`\n\n"
         f"📊 Progress: *{counts['success']}/{counts['total']}*\n\n"
         f"👇 *Retry the file or skip it?*"
     )
     try:
         await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=batch["status_msg_id"],
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=chat_id, message_id=batch["status_msg_id"],
+            text=text, parse_mode=ParseMode.MARKDOWN,
         )
+    except telegram.error.BadRequest:
+        pass
     except Exception:
         pass
     await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"], retry_skip=True)
 
-
 async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False):
     batch = user_batches.pop(user_id, None)
     counts = await _get_batch_counts(user_id)
-    # Cleanup DB rows for this user
     await db_execute("DELETE FROM pending_tasks WHERE user_id = ?", [user_id])
     cancelled_users.discard(user_id)
 
     if batch:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=batch["status_msg_id"])
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=batch["kb_msg_id"])
-        except Exception:
-            pass
+        try: await bot.delete_message(chat_id=chat_id, message_id=batch["status_msg_id"])
+        except Exception: pass
+        try: await bot.delete_message(chat_id=chat_id, message_id=batch["kb_msg_id"])
+        except Exception: pass
 
     if cancelled:
         text = f"❌ *Conversion cancelled.*\n\n✅ Success: *{counts['success']}*"
     else:
-        text = (
-            f"🎉 *Conversion finished!*\n\n"
-            f"📦 Total: *{counts['total']}*\n"
-            f"✅ Success: *{counts['success']}*"
-        )
+        text = f"🎉 *Conversion finished!*\n\n📦 Total: *{counts['total']}*\n✅ Success: *{counts['success']}*"
         if counts["failed"] > 0:
             text += f"\n⚠️ Failed/Skipped: *{counts['failed']}*"
     try:
         await bot.send_message(
-            chat_id=chat_id,
-            text=text + "\n\n👇 Use the menu below.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_main_keyboard(user_id),
+            chat_id=chat_id, text=text + "\n\n👇 Use the menu below.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id),
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 
 async def process_single_task(bot, task: dict) -> dict:
@@ -512,9 +489,7 @@ async def process_single_task(bot, task: dict) -> dict:
 
         with output_file.open("rb") as jpg_file:
             sent = await bot.send_document(
-                chat_id=chat_id,
-                document=jpg_file,
-                filename=out_name,
+                chat_id=chat_id, document=jpg_file, filename=out_name,
                 caption=f"✅ Conversion complete! Position {position}\n📄 `{out_name}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -534,48 +509,27 @@ async def process_single_task(bot, task: dict) -> dict:
 
 
 async def process_user_queue(bot, user_id: int, chat_id: int):
-    """
-    Serial processing per user — strictly by position ASC.
-    - Auto-retries up to MAX_RETRIES per file
-    - On persistent failure → prompts user (Retry / Skip) and pauses
-    - Skips nothing unless user explicitly chooses Skip
-    - Resumes from DB state on restart
-    """
     if user_id in active_processing:
         return
     active_processing.add(user_id)
     try:
         while True:
-            # Cancellation check
             if user_id in cancelled_users:
-                await db_execute(
-                    "UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status IN ('pending','processing','awaiting_retry')",
-                    [user_id],
-                )
+                await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE user_id = ? AND status IN ('pending','processing','awaiting_retry')", [user_id])
                 await finish_batch(bot, user_id, chat_id, cancelled=True)
                 return
 
-            # Pick NEXT task strictly by position (serial order)
-            task = await db_fetchone(
-                "SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'pending' ORDER BY position ASC, id ASC LIMIT 1",
-                [user_id],
-            )
+            task = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'pending' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
             if not task:
-                # Maybe an awaiting_retry task is left (shouldn't happen here, but be safe)
-                awaiting = await db_fetchone(
-                    "SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1",
-                    [user_id],
-                )
+                awaiting = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
                 if awaiting:
                     await show_retry_skip_prompt(bot, user_id, chat_id, awaiting, "Previous error")
                     return
                 await finish_batch(bot, user_id, chat_id)
                 return
 
-            # Mark as processing
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task["id"]])
 
-            # Auto-retry loop
             result = None
             attempt = 0
             while attempt < MAX_RETRIES:
@@ -600,7 +554,7 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 spawn(consume_conversion(user_id, task["source"]))
                 await update_progress_display(bot, user_id, chat_id)
                 await asyncio.sleep(0.5)
-                continue  # next file
+                continue
 
             if result["status"] == "cancelled":
                 await db_execute("UPDATE pending_tasks SET status = 'cancelled' WHERE id = ?", [task["id"]])
@@ -610,58 +564,38 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
             # Failed after auto-retries → prompt user
             await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
             await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Unknown error"))
-            return  # Wait for user decision
+            return
 
     except Exception as e:
         logger.exception(f"process_user_queue crashed for user {user_id}: {e}")
-        try:
-            await finish_batch(bot, user_id, chat_id)
-        except Exception:
-            pass
+        try: await finish_batch(bot, user_id, chat_id)
+        except Exception: pass
     finally:
         active_processing.discard(user_id)
 
 
 async def resume_user_processing(bot, user_id: int, chat_id: int):
-    """Resume from DB state after restart."""
-    # Any task that was 'processing' becomes 'pending'
     await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE user_id = ? AND status = 'processing'", [user_id])
-
     counts = await _get_batch_counts(user_id)
-    if counts["total"] == 0:
-        return
+    if counts["total"] == 0: return
 
-    # Fresh status + keyboard message for this resumed batch
     try:
         status_msg = await bot.send_message(
             chat_id=chat_id,
-            text=(
-                f"🔄 *Bot restarted — resuming...*\n\n"
-                f"📦 Total: *{counts['total']}*\n"
-                f"✅ Success: *{counts['success']}*\n"
-                f"⚠️ Failed/Skipped: *{counts['failed']}*"
-            ),
+            text=f"🔄 *Bot restarted — resuming...*\n\n📦 Total: *{counts['total']}*\n✅ Success: *{counts['success']}*\n⚠️ Failed/Skipped: *{counts['failed']}*",
             parse_mode=ParseMode.MARKDOWN,
         )
         kb_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"📊 {counts['success']}/{counts['total']}",
+            chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}",
             reply_markup=get_processing_keyboard(counts["success"], counts["total"]),
         )
         user_batches[user_id] = {
-            "total": counts["total"],
-            "status_msg_id": status_msg.message_id,
-            "kb_msg_id": kb_msg.message_id,
-            "chat_id": chat_id,
+            "total": counts["total"], "status_msg_id": status_msg.message_id,
+            "kb_msg_id": kb_msg.message_id, "chat_id": chat_id,
         }
-    except Exception:
-        return
+    except Exception: return
 
-    # If an awaiting_retry exists, prompt user first; otherwise continue serial processing
-    awaiting = await db_fetchone(
-        "SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1",
-        [user_id],
-    )
+    awaiting = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
     if awaiting:
         await show_retry_skip_prompt(bot, user_id, chat_id, awaiting, "Previous error (resumed after restart)")
     else:
@@ -669,7 +603,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC
+# IMAGE CONVERSION LOGIC (🚀 FIXED HEIC SCALE ERROR)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -685,15 +619,14 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
             heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            w, h = heif.size
-            if w > MAX_DIMENSION or h > MAX_DIMENSION:
-                heif = heif.scale(min(MAX_DIMENSION / w, MAX_DIMENSION / h))
+            # 🚀 FIXED: HeifFile doesn't have .scale(), we convert to Pillow Image first
             image = heif.to_pillow()
         else:
             image = Image.open(input_file)
             try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
             except: pass
 
+        # 🚀 Resize safely using Pillow's thumbnail
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
@@ -955,7 +888,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     spawn(ensure_user(user))
 
-    # Block new uploads if user has active/awaiting batch
     if user.id in active_processing or user.id in user_batches:
         await message.reply_text(
             "⏳ You already have unfinished conversions.\nPlease finish or cancel them first.",
@@ -1036,7 +968,6 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
         except: pass
         del context.user_data["last_status_msg"]
 
-    # 1) Insert all tasks in DB (serial position 1..N)
     now = now_bd().isoformat()
     for i, doc in enumerate(docs, start=1):
         await db_execute(
@@ -1045,12 +976,10 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
             [user_id, message.chat_id, doc["file_id"], doc["filename"], doc["file_size"], doc["source"], now, i]
         )
 
-    # 2) Status message (text, updated via edit)
     status_msg = await message.reply_text(
         f"🚀 *Converting files...*\n\n📦 Total: *{total}*\n✅ Success: *0*\n⚠️ Failed/Skipped: *0*",
         parse_mode=ParseMode.MARKDOWN
     )
-    # 3) Floating keyboard message (deleted/resend on update, because reply keyboards can't be edited)
     kb_msg = await message.reply_text(
         f"📊 0/{total}",
         reply_markup=get_processing_keyboard(0, total)
@@ -1063,7 +992,6 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
         "chat_id": message.chat_id,
     }
 
-    # 4) Start SERIAL processing
     spawn(process_user_queue(context.bot, user_id, message.chat_id))
 
 
@@ -1091,10 +1019,8 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
         [user_id]
     )
 
-    # If loop is running, it will notice and finish. If not (awaiting_retry), finish manually.
     if user_id not in active_processing:
         await finish_batch(context.bot, user_id, chat_id, cancelled=True)
-    # else: loop finishes batch
 
 
 async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1104,7 +1030,7 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = message.chat_id
 
     if user_id in active_processing:
-        return  # already running
+        return
 
     task = await db_fetchone(
         "SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1",
@@ -1114,11 +1040,13 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("✅ No failed file to retry.", reply_markup=get_main_keyboard(user_id))
         return
 
-    # Reset retry count and requeue as pending (STILL at same position → serial preserved)
     await db_execute(
         "UPDATE pending_tasks SET status = 'pending', retry_count = 0 WHERE id = ?",
         [task["id"]]
     )
+    
+    # 🚀 Immediately update UI to show it's processing again
+    await update_progress_display(context.bot, user_id, chat_id)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
@@ -1141,6 +1069,9 @@ async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
     spawn(record_conversion(user_id, task["filename"], "failed", task["source"], task["file_size"], None, task["file_id"]))
+    
+    # 🚀 Immediately update UI
+    await update_progress_display(context.bot, user_id, chat_id)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
@@ -1291,7 +1222,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
 
-    # Any 'processing' task is reset to 'pending' so it's picked up again by the serial processor
     await db_execute("UPDATE pending_tasks SET status = 'pending' WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
