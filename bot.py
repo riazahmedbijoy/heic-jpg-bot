@@ -88,7 +88,7 @@ CONVS_PER_PAGE = 8
 
 # 🚀 Limits & Retries
 MAX_RETRIES = 3
-MAX_BATCH_SIZE = 50  # Prevent server OOM and massive queues
+MAX_BATCH_SIZE = 1000  # 🚀 বড় বাল্ক আপলোডের জন্য লিমিট বাড়ানো হলো (১০০০ ফাইল)
 
 # 🚀 In-memory state
 user_uploads: dict[int, list[dict]] = {}
@@ -147,7 +147,6 @@ def get_processing_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboard
     )
 
 def get_retry_skip_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboardMarkup:
-    """Retry / Skip buttons appear ABOVE the progress count."""
     btn_text = f"🔄 Progress: {completed}/{total}" if total > 0 else "🔄 Converting..."
     return ReplyKeyboardMarkup(
         [
@@ -919,6 +918,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_supported_file(filename):
         await message.reply_text("❌ *Unsupported file type.*", parse_mode="Markdown")
         return
+        
+    if (document.file_size or 0) > MAX_FILE_SIZE_BYTES:
+        await message.reply_text(f"❌ *File is too large.*\nMaximum size is {MAX_FILE_SIZE_MB}MB.", parse_mode="Markdown")
+        return
 
     allowed, source = await can_convert(user.id)
     if not allowed:
@@ -933,11 +936,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user_uploads[user.id] = []
 
         if len(user_uploads[user.id]) >= MAX_BATCH_SIZE:
-            await message.reply_text(
-                f"⚠️ You have reached the maximum limit of {MAX_BATCH_SIZE} files per batch.\n"
-                "Please tap '✅ Done - Start Conversion' to process these files.",
-                reply_markup=get_upload_keyboard(len(user_uploads[user.id]))
-            )
+            # 🚀 Send warning ONLY ONCE instead of spamming on every file
+            if not context.user_data.get("limit_warned"):
+                context.user_data["limit_warned"] = True
+                await message.reply_text(
+                    f"⚠️ You have reached the maximum limit of {MAX_BATCH_SIZE} files per batch.\n"
+                    "Please tap '✅ Done - Start Conversion' to process these files."
+                )
             return
 
         user_uploads[user.id].append({
@@ -972,6 +977,7 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user: return
 
     user_id = user.id
+    context.user_data.pop("limit_warned", None) # Reset warning flag
 
     if user_id in active_processing or user_id in user_batches:
         await message.reply_text(
@@ -1025,6 +1031,8 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
+    context.user_data.pop("limit_warned", None)
+    
     count = len(user_uploads.get(user.id, []))
     user_uploads[user.id] = []
     if "last_status_msg" in context.user_data:
@@ -1040,6 +1048,9 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
     if not user: return
     user_id = user.id
     chat_id = message.chat_id
+
+    if user_id in cancelled_users:
+        return # 🚀 Prevent spam if already cancelling
 
     cancelled_users.add(user_id)
     await db_execute(
