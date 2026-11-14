@@ -87,7 +87,7 @@ USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
 # 🚀 Concurrency
-MAX_WORKERS = 1  # 🚀 1 Worker to prevent RAM crash
+MAX_WORKERS = 1  
 MAX_RETRIES = 3
 conversion_queue = asyncio.Queue()
 
@@ -350,11 +350,11 @@ async def update_progress(bot, batch, text):
     except Exception:
         pass
 
-    # 🚀 2. Update the floating keyboard via an invisible message
+    # 🚀 2. Update the floating keyboard via a visible message, then delete it
     try:
         new_kb = await bot.send_message(
             chat_id=batch["chat_id"],
-            text="\u200b",
+            text="🔄 Updating...", # FIXED: Non-empty text to prevent BadRequest
             reply_markup=get_processing_keyboard(batch["completed"], batch["total"])
         )
         if "kb_msg_id" in batch and batch["kb_msg_id"]:
@@ -490,7 +490,7 @@ async def queue_worker(application: Application, worker_id: int):
                             
                             await update_progress(bot, batch, text)
 
-            # 🚀 Force memory cleanup to prevent crash at 78
+            # 🚀 Force memory cleanup
             safe_unlink(input_file)
             safe_unlink(output_file)
             gc.collect() 
@@ -848,8 +848,8 @@ async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # 🚀 Send keyboard as a separate invisible message to keep it at the bottom
-    kb_msg = await message.reply_text("\u200b", reply_markup=get_processing_keyboard(0, total))
+    # 🚀 Send keyboard as a separate visible message to keep it at the bottom
+    kb_msg = await message.reply_text("🔄 Updating...", reply_markup=get_processing_keyboard(0, total))
     
     user_batches[user_id] = {
         "total": total, "completed": 0, "failed": 0,
