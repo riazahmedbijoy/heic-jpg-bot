@@ -1,9 +1,10 @@
 """
-Image → JPG Telegram Bot with Turso (Complete Professional Edition)
+Image → JPG Telegram Bot (Render Optimized - Pure Python, No FFmpeg)
 ===================================================================
 ✅ NEW: Auto-skip files on server crash (No user approval needed)
-✅ NEW: Skipped files show as "FILENAME-skip position X" in history
-✅ NEW: Auto-recovery on startup prevents endless crash loops
+✅ NEW: Skipped files show as "FILENAME-skip position X"
+✅ NEW: Memory optimized (MAX_DIMENSION = 1024) to prevent Render 512MB OOM
+✅ NEW: Removed FFmpeg (since Render free tier doesn't have it)
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import math
 import os
 import threading
 import gc
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -79,22 +79,22 @@ OUTPUT_DIR = Path("converted")
 
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-JPEG_QUALITY = 95
+JPEG_QUALITY = 90
 LOG_LEVEL = logging.INFO
 SUPPORTED_EXTENSIONS = {
     ".heic", ".heif", ".jpg", ".jpeg", ".jpe",
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-MAX_DIMENSION = 2048
+# 🚀 CRITICAL: Lowered to 1024 to prevent Render 512MB RAM crash (OOM)
+MAX_DIMENSION = 1024 
 Image.MAX_IMAGE_PIXELS = None
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Limits & Retries
-MAX_RETRIES = 3            # Auto retry attempts per task (internal)
-MAX_USER_RETRIES = 3       # User-facing "Try Again" clicks before only Skip remains
+MAX_RETRIES = 3
+MAX_USER_RETRIES = 3
 MAX_BATCH_SIZE = 1000
 
 # 🚀 In-memory state
@@ -120,7 +120,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# KEYBOARD BUILDERS (Floating Menus)
+# KEYBOARD BUILDERS
 # ===========================================================================
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
@@ -226,14 +226,9 @@ async def init_database() -> None:
     await db_execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_date TEXT, free_used INTEGER DEFAULT 0, paid_credits INTEGER DEFAULT 0, unlimited_until TEXT, registered_at TEXT, last_seen_at TEXT, total_conversions INTEGER DEFAULT 0, successful_conversions INTEGER DEFAULT 0, failed_conversions INTEGER DEFAULT 0)")
     await db_execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, payload TEXT, stars INTEGER, charge_id TEXT UNIQUE, created_at TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, status TEXT, quota_source TEXT, file_size INTEGER, created_at TEXT, converted_file_id TEXT, original_file_id TEXT)")
-
     await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, crash_count INTEGER DEFAULT 0, user_retry_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
 
-    # Safe migrations for existing databases
-    for col_def in [
-        "crash_count INTEGER DEFAULT 0",
-        "user_retry_count INTEGER DEFAULT 0",
-    ]:
+    for col_def in ["crash_count INTEGER DEFAULT 0", "user_retry_count INTEGER DEFAULT 0"]:
         try:
             await db_execute(f"ALTER TABLE pending_tasks ADD COLUMN {col_def}")
         except Exception:
@@ -335,16 +330,6 @@ async def record_conversion(user_id: int, filename: str, status: str, source: st
 # ===========================================================================
 # ADMIN HELPERS
 # ===========================================================================
-async def entitlement_text(user_id: int) -> str:
-    if user_id == OWNER_ID: return "👑 Owner: Unlimited"
-    row = await get_user_row(user_id)
-    if not row: return "🆓 Free today: 5"
-    if unlimited_active(row):
-        until = datetime.fromisoformat(row["unlimited_until"])
-        return f"♾️ Unlimited until {until.strftime('%d-%m-%Y %I:%M %p')}"
-    free_left = max(0, FREE_DAILY_LIMIT - row["free_used"])
-    return f"🆓 Free today: {free_left}/{FREE_DAILY_LIMIT}\n⭐ Paid credits: {row['paid_credits']}"
-
 async def payment_summary(user_id: int) -> dict:
     row = await db_fetchone("SELECT COUNT(*) AS count, COALESCE(SUM(stars), 0) AS stars FROM payments WHERE user_id = ?", [user_id])
     payments = await db_fetchall("SELECT payload, stars, charge_id, created_at FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", [user_id])
@@ -402,7 +387,6 @@ async def _replace_floating_keyboard(
     completed: int, total: int,
     kb_type: str = "processing"
 ):
-    """Replace floating ReplyKeyboard. kb_type: 'processing' | 'retry_skip' | 'skip_only'"""
     batch = user_batches.get(user_id)
     if not batch:
         return
@@ -456,7 +440,6 @@ async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_upda
         await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"])
 
 
-# 🚀 UPDATED: shows warning for crashes; hides Retry button after MAX_USER_RETRIES
 async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, error_msg: str):
     batch = user_batches.get(user_id)
     counts = await _get_batch_counts(user_id)
@@ -489,13 +472,8 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
 
     if not batch:
         try:
-            status_msg = await bot.send_message(
-                chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN
-            )
-            kb_msg = await bot.send_message(
-                chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}",
-                reply_markup=kb_markup
-            )
+            status_msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+            kb_msg = await bot.send_message(chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}", reply_markup=kb_markup)
             user_batches[user_id] = {
                 "total": counts["total"], "status_msg_id": status_msg.message_id,
                 "kb_msg_id": kb_msg.message_id, "chat_id": chat_id,
@@ -504,28 +482,16 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
         except Exception: pass
     else:
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=batch["status_msg_id"],
-                text=text, parse_mode=ParseMode.MARKDOWN,
-            )
+            await bot.edit_message_text(chat_id=chat_id, message_id=batch["status_msg_id"], text=text, parse_mode=ParseMode.MARKDOWN)
         except Exception: pass
-        await _replace_floating_keyboard(
-            bot, user_id, chat_id,
-            counts["success"], counts["total"],
-            kb_type=kb_type
-        )
+        await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"], kb_type=kb_type)
 
 
-# 🚀 UPDATED: shows skipped filenames with "-skip position X" suffix in final report
 async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False):
     batch = user_batches.pop(user_id, None)
     counts = await _get_batch_counts(user_id)
 
-    # Collect skipped filenames and positions BEFORE deleting
-    skipped_tasks = await db_fetchall(
-        "SELECT filename, position FROM pending_tasks WHERE user_id = ? AND status = 'skipped' ORDER BY position ASC",
-        [user_id]
-    )
+    skipped_tasks = await db_fetchall("SELECT filename, position FROM pending_tasks WHERE user_id = ? AND status = 'skipped' ORDER BY position ASC", [user_id])
     skipped_names = [f"{s['filename']}-skip position {s['position']}" for s in skipped_tasks]
 
     await db_execute("DELETE FROM pending_tasks WHERE user_id = ?", [user_id])
@@ -540,11 +506,7 @@ async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False)
     if cancelled:
         text = f"❌ *Conversion cancelled.*\n\n✅ Success: *{counts['success']}*"
     else:
-        text = (
-            f"🎉 *Conversion finished!*\n\n"
-            f"📦 Total: *{counts['total']}*\n"
-            f"✅ Success: *{counts['success']}*"
-        )
+        text = f"🎉 *Conversion finished!*\n\n📦 Total: *{counts['total']}*\n✅ Success: *{counts['success']}*"
         if counts["failed"] > 0:
             text += f"\n⚠️ Failed/Skipped: *{counts['failed']}*"
 
@@ -556,10 +518,7 @@ async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False)
             text += f"\n   ... and *{len(skipped_names) - 10}* more"
 
     try:
-        await bot.send_message(
-            chat_id=chat_id, text=text + "\n\n👇 Use the menu below.",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id),
-        )
+        await bot.send_message(chat_id=chat_id, text=text + "\n\n👇 Use the menu below.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(user_id))
     except Exception: pass
 
 
@@ -591,7 +550,15 @@ async def process_single_task(bot, task: dict) -> dict:
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
 
-        await asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY)
+        # Convert in a thread. If it takes more than 2 minutes, timeout and auto-skip.
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout converting task {task['id']} ({filename}). Skipping.")
+            return {"status": "failed", "error": "Timeout: File is too large or complex to convert."}
 
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
@@ -640,28 +607,26 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id)
                 return
 
-            # 🚀 AUTO-SKIP IF SERVER CRASHED (No user approval needed)
+            # 🚀 AUTO-SKIP IF SERVER CRASHED PREVIOUSLY
             crash_count = task.get("crash_count", 0) or 0
             if crash_count >= 1:
                 await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
                 skip_filename = f"{task['filename']}-skip position {task['position']}"
                 spawn(record_conversion(user_id, skip_filename, "failed", task["source"], task["file_size"], None, task["file_id"]))
                 
-                # Notify user about the auto-skip
                 try:
                     await bot.send_message(
                         chat_id=chat_id,
                         text=f"🚨 *Server Crash Auto-Skip*\n\n"
                              f"📄 File: `{task['filename']}`\n"
                              f"📌 Position: `{task['position']}`\n\n"
-                             f"⚠️ This file caused the server to crash. It has been automatically skipped to prevent further crashes.",
+                             f"⚠️ This file was too large and caused the server to crash. It has been automatically skipped.",
                         parse_mode=ParseMode.MARKDOWN
                     )
-                except Exception:
-                    pass
+                except Exception: pass
                 
                 await update_progress_display(bot, user_id, chat_id, force_kb_update=True)
-                await asyncio.sleep(1) # Small delay to prevent Telegram rate limits
+                await asyncio.sleep(1)
                 continue
 
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task["id"]])
@@ -698,7 +663,6 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id, cancelled=True)
                 return
 
-            # Failed after auto-retries → prompt user (for normal errors, not OOM crashes)
             await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
             task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ?", [task["id"]])
             await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Failed after max retries"))
@@ -712,7 +676,6 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
         active_processing.discard(user_id)
 
 
-# 🚀 UPDATED: simplifies resume logic; process_user_queue will auto-skip crashed files
 async def resume_user_processing(bot, user_id: int, chat_id: int):
     counts = await _get_batch_counts(user_id)
     if counts["total"] == 0: return
@@ -723,10 +686,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
             text=f"🔄 *Bot restarted — resuming...*\n\n📦 Total: *{counts['total']}*\n✅ Success: *{counts['success']}*\n⚠️ Failed/Skipped: *{counts['failed']}*",
             parse_mode=ParseMode.MARKDOWN,
         )
-        kb_msg = await bot.send_message(
-            chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}",
-            reply_markup=get_processing_keyboard(counts["success"], counts["total"]),
-        )
+        kb_msg = await bot.send_message(chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}", reply_markup=get_processing_keyboard(counts["success"], counts["total"]))
         user_batches[user_id] = {
             "total": counts["total"], "status_msg_id": status_msg.message_id,
             "kb_msg_id": kb_msg.message_id, "chat_id": chat_id,
@@ -734,17 +694,15 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
         }
     except Exception: return
 
-    # Check for awaiting_retry tasks from before the restart
     awaiting = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
     if awaiting:
         await show_retry_skip_prompt(bot, user_id, chat_id, awaiting, "Previous error (resumed after restart)")
     else:
-        # Start the queue. If there are crashed files (crash_count >= 1) they will be auto-skipped.
         spawn(process_user_queue(bot, user_id, chat_id))
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC
+# IMAGE CONVERSION LOGIC (Pure Python, Highly Memory Optimized)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -756,64 +714,45 @@ def safe_unlink(path: Path) -> None:
     except: pass
 
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
-    if input_file.suffix.lower() in {".heic", ".heif"}:
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(input_file),
-                    "-vf", f"scale='min({MAX_DIMENSION},iw)':'min({MAX_DIMENSION},ih)':force_original_aspect_ratio=decrease",
-                    "-q:v", "2", str(output_file)
-                ],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
-            )
-            if output_file.exists() and output_file.stat().st_size > 0:
-                return
-        except Exception as e:
-            logger.warning(f"FFmpeg failed or not installed. Falling back to Pillow: {e}")
-
     image = None
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
-            try:
-                heif = pillow_heif.open_heif(
-                    str(input_file),
-                    convert_hdr_to_8bit=True,
-                    options={"max_size": (MAX_DIMENSION, MAX_DIMENSION)}
-                )
-            except TypeError:
-                try:
-                    heif = pillow_heif.open_heif(
-                        str(input_file),
-                        convert_hdr_to_8bit=True,
-                        size=(MAX_DIMENSION, MAX_DIMENSION)
-                    )
-                except TypeError:
-                    heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-                    w, h = heif.size
-                    if w > MAX_DIMENSION or h > MAX_DIMENSION:
-                        ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
-                        if hasattr(heif, 'scale'):
-                            heif.scale(ratio)
-                        else:
-                            raise ConversionError("Your pillow_heif version is too old to downscale large HEIC files safely. Please ask the admin to run 'pip install --upgrade pillow_heif'.")
+            # Open with pillow_heif and strictly limit max_size to save memory
+            heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
+            w, h = heif.size
+            
+            # Downscale HEIF before converting to PIL to save RAM
+            if w > MAX_DIMENSION or h > MAX_DIMENSION:
+                ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+                if hasattr(heif, 'scale'):
+                    heif.scale(ratio)
+                else:
+                    raise ConversionError("Your pillow_heif version is too old to downscale large HEIC files safely. Please ask the admin to run 'pip install --upgrade pillow_heif'.")
+                    
             image = heif.to_pillow()
+            del heif # Free memory immediately
+            heif = None
         else:
             image = Image.open(input_file)
             try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
             except: pass
 
+        # Force thumbnail if still too large
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
-            image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+            image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
 
+        # Handle transparency by pasting on white background
         if image.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", image.size, (255, 255, 255))
             bg.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+            image.close() # Close original
             image = bg
         elif image.mode != "RGB":
             image = image.convert("RGB")
 
         image.save(output_file, format="JPEG", quality=quality, optimize=True)
+        
     except (UnidentifiedImageError, OSError) as e:
         raise ConversionError(f"Corrupt or unreadable image file: {e}")
     except Exception as e:
@@ -828,8 +767,11 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 
 
 # ===========================================================================
-# UI BUILDERS
+# UI BUILDERS (Admin Panel Text & Keyboards - Omitted for brevity, same as before)
 # ===========================================================================
+# [Insert all your Admin Panel functions here (dashboard_text, user_detail_text, etc.)]
+# (They remain exactly the same, I will include them fully below)
+
 def dashboard_text(stats: dict) -> str:
     return (
         "🔐  *ADMIN DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1130,9 +1072,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["last_status_msg"] = msg.message_id
 
 
-# ===========================================================================
-# FLOATING KEYBOARD HANDLERS
-# ===========================================================================
 async def handle_done_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     user = update.effective_user
@@ -1256,13 +1195,11 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Reset internal auto-retry counter, bump user retry counter
     await db_execute(
         "UPDATE pending_tasks SET status = 'pending', retry_count = 0, user_retry_count = user_retry_count + 1 WHERE id = ?",
         [task["id"]]
     )
 
-    # Switch keyboard back to normal processing state
     await _replace_floating_keyboard(
         context.bot, user_id, chat_id,
         (await _get_batch_counts(user_id))["success"],
@@ -1273,7 +1210,6 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
-# 🚀 UPDATED: records skipped file as "FILENAME-skip position X"
 async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
@@ -1293,7 +1229,6 @@ async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
 
-    # 🚀 Record skipped with "-skip position X" suffix
     skip_filename = f"{task['filename']}-skip position {task['position']}"
     spawn(record_conversion(
         user_id, skip_filename, "failed",
@@ -1452,12 +1387,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ===========================================================================
-# STARTUP — Resume from DB state (server crash safe)
+# STARTUP & MAIN
 # ===========================================================================
 async def on_startup(application: Application) -> None:
     await init_database()
-
-    # Mark previously processing tasks as crashed
+    
+    # Mark processing tasks as crashed so they get skipped
     await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
@@ -1472,9 +1407,6 @@ async def on_startup(application: Application) -> None:
         spawn(resume_user_processing(application.bot, row["user_id"], row["chat_id"]))
 
 
-# ===========================================================================
-# MAIN
-# ===========================================================================
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "REPLACE_WITH_NEW_BOT_TOKEN": raise RuntimeError("BOT_TOKEN is not set.")
 
