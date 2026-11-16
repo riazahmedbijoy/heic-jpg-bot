@@ -1,10 +1,10 @@
 """
-Image → JPG Telegram Bot (Render Optimized - Pure Python, No FFmpeg)
+Image → JPG Telegram Bot with Turso (Professional, Crash-Free Edition)
 ===================================================================
-✅ NEW: Auto-skip files on server crash (No user approval needed)
-✅ NEW: Skipped files show as "FILENAME-skip position X"
-✅ NEW: Memory optimized (MAX_DIMENSION = 1024) to prevent Render 512MB OOM
-✅ NEW: Removed FFmpeg (since Render free tier doesn't have it)
+✅ NEW: Removed FFmpeg (Pure Python for Render compatibility)
+✅ NEW: Memory Optimized (MAX_DIMENSION = 1024) to prevent 512MB OOM
+✅ NEW: Added 2-minute Timeout to skip infinite hangs
+✅ NEW: Auto-skip crashed files on restart ("FILENAME-skip position X")
 """
 
 from __future__ import annotations
@@ -93,9 +93,11 @@ Image.MAX_IMAGE_PIXELS = None
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-MAX_RETRIES = 3
-MAX_USER_RETRIES = 3
+# 🚀 Limits & Retries
+MAX_RETRIES = 3            # Auto retry attempts per task (internal)
+MAX_USER_RETRIES = 3       # User-facing "Try Again" clicks before only Skip remains
 MAX_BATCH_SIZE = 1000
+CONVERSION_TIMEOUT = 120   # 2 Minutes timeout per file
 
 # 🚀 In-memory state
 user_uploads: dict[int, list[dict]] = {}
@@ -120,7 +122,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# KEYBOARD BUILDERS
+# KEYBOARD BUILDERS (Floating Menus)
 # ===========================================================================
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
@@ -226,6 +228,7 @@ async def init_database() -> None:
     await db_execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_date TEXT, free_used INTEGER DEFAULT 0, paid_credits INTEGER DEFAULT 0, unlimited_until TEXT, registered_at TEXT, last_seen_at TEXT, total_conversions INTEGER DEFAULT 0, successful_conversions INTEGER DEFAULT 0, failed_conversions INTEGER DEFAULT 0)")
     await db_execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, payload TEXT, stars INTEGER, charge_id TEXT UNIQUE, created_at TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, status TEXT, quota_source TEXT, file_size INTEGER, created_at TEXT, converted_file_id TEXT, original_file_id TEXT)")
+
     await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, crash_count INTEGER DEFAULT 0, user_retry_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
 
     for col_def in ["crash_count INTEGER DEFAULT 0", "user_retry_count INTEGER DEFAULT 0"]:
@@ -550,11 +553,11 @@ async def process_single_task(bot, task: dict) -> dict:
         if user_id in cancelled_users:
             return {"status": "cancelled", "error": "User cancelled"}
 
-        # Convert in a thread. If it takes more than 2 minutes, timeout and auto-skip.
+        # 🚀 ADDED TIMEOUT: If conversion takes > 2 mins, it aborts and skips
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(convert_to_jpg, input_file, output_file, JPEG_QUALITY),
-                timeout=120
+                timeout=CONVERSION_TIMEOUT
             )
         except asyncio.TimeoutError:
             logger.warning(f"Timeout converting task {task['id']} ({filename}). Skipping.")
@@ -718,35 +721,31 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
-            # Open with pillow_heif and strictly limit max_size to save memory
             heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
             w, h = heif.size
             
-            # Downscale HEIF before converting to PIL to save RAM
             if w > MAX_DIMENSION or h > MAX_DIMENSION:
                 ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
                 if hasattr(heif, 'scale'):
                     heif.scale(ratio)
                 else:
-                    raise ConversionError("Your pillow_heif version is too old to downscale large HEIC files safely. Please ask the admin to run 'pip install --upgrade pillow_heif'.")
+                    raise ConversionError("Your pillow_heif version is too old. Please ask admin to upgrade.")
                     
             image = heif.to_pillow()
-            del heif # Free memory immediately
+            del heif
             heif = None
         else:
             image = Image.open(input_file)
             try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
             except: pass
 
-        # Force thumbnail if still too large
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
 
-        # Handle transparency by pasting on white background
         if image.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", image.size, (255, 255, 255))
             bg.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
-            image.close() # Close original
+            image.close()
             image = bg
         elif image.mode != "RGB":
             image = image.convert("RGB")
@@ -767,11 +766,8 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 
 
 # ===========================================================================
-# UI BUILDERS (Admin Panel Text & Keyboards - Omitted for brevity, same as before)
+# UI BUILDERS (Admin Panel)
 # ===========================================================================
-# [Insert all your Admin Panel functions here (dashboard_text, user_detail_text, etc.)]
-# (They remain exactly the same, I will include them fully below)
-
 def dashboard_text(stats: dict) -> str:
     return (
         "🔐  *ADMIN DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1387,12 +1383,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ===========================================================================
-# STARTUP & MAIN
+# STARTUP — Resume from DB state (server crash safe)
 # ===========================================================================
 async def on_startup(application: Application) -> None:
     await init_database()
-    
-    # Mark processing tasks as crashed so they get skipped
+
+    # Mark previously processing tasks as crashed
     await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
@@ -1407,6 +1403,9 @@ async def on_startup(application: Application) -> None:
         spawn(resume_user_processing(application.bot, row["user_id"], row["chat_id"]))
 
 
+# ===========================================================================
+# MAIN
+# ===========================================================================
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "REPLACE_WITH_NEW_BOT_TOKEN": raise RuntimeError("BOT_TOKEN is not set.")
 
