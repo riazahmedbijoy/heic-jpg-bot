@@ -1,6 +1,10 @@
 """
 Image → JPG Telegram Bot with Turso (Complete Professional Edition)
 ===================================================================
+✅ NEW: Skip files show as "FILENAME-skip" in history
+✅ NEW: Floating crash warning when large files cause server OOM
+✅ NEW: Retry button disappears after 3 attempts (only Skip remains)
+✅ NEW: Auto-detect crashed files on server restart and prompt user
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ import math
 import os
 import threading
 import gc
-import subprocess  # 🚀 Added for memory-efficient image conversion
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -83,23 +87,23 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-# 🚀 Memory Limits to prevent Render Server Crash (OOM)
-MAX_DIMENSION = 2048 # 🚀 Reduced to 2048 for 512MB RAM safety
+MAX_DIMENSION = 2048
 Image.MAX_IMAGE_PIXELS = None
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Limits & Retries
-MAX_RETRIES = 5
-MAX_BATCH_SIZE = 1000 
+# 🚀 Retry limits
+MAX_RETRIES = 3            # Auto retry attempts per task (internal)
+MAX_USER_RETRIES = 3       # User-facing "Try Again" clicks before only Skip remains
+MAX_BATCH_SIZE = 1000
 
 # 🚀 In-memory state
 user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
 user_locks: dict[int, asyncio.Lock] = {}
-active_processing: set[int] = set()   # user_ids currently being processed
+active_processing: set[int] = set()
 
 # ===========================================================================
 # INITIALIZATION
@@ -161,6 +165,19 @@ def get_retry_skip_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboard
         one_time_keyboard=False
     )
 
+# 🚀 NEW: Skip-only keyboard (after 3 retries exhausted)
+def get_skip_only_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboardMarkup:
+    btn_text = f"🔄 Progress: {completed}/{total}" if total > 0 else "🔄 Converting..."
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("⏭️ Skip This File")],
+            [KeyboardButton(btn_text)],
+            [KeyboardButton("❌ Cancel Conversion")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -211,15 +228,18 @@ async def init_database() -> None:
     await db_execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_date TEXT, free_used INTEGER DEFAULT 0, paid_credits INTEGER DEFAULT 0, unlimited_until TEXT, registered_at TEXT, last_seen_at TEXT, total_conversions INTEGER DEFAULT 0, successful_conversions INTEGER DEFAULT 0, failed_conversions INTEGER DEFAULT 0)")
     await db_execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, payload TEXT, stars INTEGER, charge_id TEXT UNIQUE, created_at TEXT)")
     await db_execute("CREATE TABLE IF NOT EXISTS conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, status TEXT, quota_source TEXT, file_size INTEGER, created_at TEXT, converted_file_id TEXT, original_file_id TEXT)")
-    
-    # 🚀 Add crash_count column directly to table creation
-    await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, crash_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
-    
-    # 🚀 Add crash_count for existing databases
-    try:
-        await db_execute("ALTER TABLE pending_tasks ADD COLUMN crash_count INTEGER DEFAULT 0")
-    except:
-        pass
+
+    await db_execute("CREATE TABLE IF NOT EXISTS pending_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, file_id TEXT, filename TEXT, file_size INTEGER, source TEXT, retry_count INTEGER DEFAULT 0, crash_count INTEGER DEFAULT 0, user_retry_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', created_at TEXT, position INTEGER DEFAULT 1)")
+
+    # Safe migrations for existing databases
+    for col_def in [
+        "crash_count INTEGER DEFAULT 0",
+        "user_retry_count INTEGER DEFAULT 0",
+    ]:
+        try:
+            await db_execute(f"ALTER TABLE pending_tasks ADD COLUMN {col_def}")
+        except Exception:
+            pass
 
 
 # ===========================================================================
@@ -360,7 +380,7 @@ async def search_users(query: str, limit: int = 30) -> list[dict]:
 
 
 # ===========================================================================
-# 🚀 SERIAL PER-USER PROCESSING
+# SERIAL PER-USER PROCESSING
 # ===========================================================================
 
 async def _get_batch_counts(user_id: int) -> dict:
@@ -378,12 +398,24 @@ async def _get_batch_counts(user_id: int) -> dict:
         "failed": row["failed"] if row else 0,
     }
 
-async def _replace_floating_keyboard(bot, user_id: int, chat_id: int, completed: int, total: int, retry_skip: bool = False):
+
+async def _replace_floating_keyboard(
+    bot, user_id: int, chat_id: int,
+    completed: int, total: int,
+    kb_type: str = "processing"
+):
+    """Replace floating ReplyKeyboard. kb_type: 'processing' | 'retry_skip' | 'skip_only'"""
     batch = user_batches.get(user_id)
     if not batch:
         return
     try:
-        kb_markup = get_retry_skip_keyboard(completed, total) if retry_skip else get_processing_keyboard(completed, total)
+        if kb_type == "retry_skip":
+            kb_markup = get_retry_skip_keyboard(completed, total)
+        elif kb_type == "skip_only":
+            kb_markup = get_skip_only_keyboard(completed, total)
+        else:
+            kb_markup = get_processing_keyboard(completed, total)
+
         new_msg = await bot.send_message(
             chat_id=chat_id,
             text=f"📊 {completed}/{total}",
@@ -397,11 +429,12 @@ async def _replace_floating_keyboard(bot, user_id: int, chat_id: int, completed:
     except Exception as e:
         logger.warning(f"Keyboard replace failed: {e}")
 
+
 async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_update: bool = False):
     batch = user_batches.get(user_id)
     if not batch: return
     counts = await _get_batch_counts(user_id)
-    
+
     text = (
         f"🚀 *Converting files...*\n\n"
         f"📦 Total: *{counts['total']}*\n"
@@ -414,7 +447,7 @@ async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_upda
             text=text, parse_mode=ParseMode.MARKDOWN,
         )
     except telegram.error.BadRequest:
-        pass 
+        pass
     except Exception:
         pass
 
@@ -424,27 +457,62 @@ async def update_progress_display(bot, user_id: int, chat_id: int, force_kb_upda
         batch["last_kb_update"] = current
         await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"])
 
+
+# 🚀 UPDATED: shows warning for crashes; hides Retry button after MAX_USER_RETRIES
 async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, error_msg: str):
     batch = user_batches.get(user_id)
     counts = await _get_batch_counts(user_id)
     safe_err = str(error_msg).replace('`', '').replace('*', '').replace('_', ' ')
     safe_fn = str(task['filename']).replace('`', '')
-    
+
+    user_retries = task.get("user_retry_count", 0) or 0
+    crash_count = task.get("crash_count", 0) or 0
+    can_retry = user_retries < MAX_USER_RETRIES
+
+    # 🚀 Crash / large-file warning
+    warning = ""
+    if crash_count > 0:
+        file_size_mb = (task.get("file_size", 0) or 0) / (1024 * 1024)
+        size_line = ""
+        if file_size_mb > MAX_FILE_SIZE_MB * 0.6:
+            size_line = f"\n   📦 File size: *{file_size_mb:.1f}MB* (close to {MAX_FILE_SIZE_MB}MB limit)"
+        warning = (
+            f"\n🚨 *WARNING: Server Crash Detected!*\n"
+            f"   This file caused the server to crash *{crash_count}* time(s).\n"
+            f"   The file may be *too large* or *corrupted*.{size_line}\n"
+            f"   💡 *Recommended:* Tap *⏭️ Skip This File* to continue safely.\n"
+        )
+
     text = (
         f"⚠️ *Conversion failed!*\n\n"
         f"📄 File: `{safe_fn}`\n"
-        f"❗ Error: `{safe_err}`\n\n"
-        f"📊 Progress: *{counts['success']}/{counts['total']}*\n\n"
-        f"👇 *Retry the file or skip it?*"
+        f"❗ Error: `{safe_err}`\n"
+        f"{warning}\n"
+        f"📊 Progress: *{counts['success']}/{counts['total']}*\n"
+        f"🔁 Retries used: *{user_retries}/{MAX_USER_RETRIES}*\n\n"
     )
 
-    # 🚀 If server restarted, user_batches will be missing. Create it!
+    if can_retry:
+        text += "👇 *Retry the file or skip it?*"
+        kb_type = "retry_skip"
+        kb_markup = get_retry_skip_keyboard(counts["success"], counts["total"])
+    else:
+        text += (
+            f"❌ *Maximum retries reached!*\n"
+            f"Only *⏭️ Skip This File* is available now.\n"
+            f"Tap it to continue with the next file."
+        )
+        kb_type = "skip_only"
+        kb_markup = get_skip_only_keyboard(counts["success"], counts["total"])
+
     if not batch:
         try:
-            status_msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+            status_msg = await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN
+            )
             kb_msg = await bot.send_message(
                 chat_id=chat_id, text=f"📊 {counts['success']}/{counts['total']}",
-                reply_markup=get_retry_skip_keyboard(counts["success"], counts["total"])
+                reply_markup=kb_markup
             )
             user_batches[user_id] = {
                 "total": counts["total"], "status_msg_id": status_msg.message_id,
@@ -459,11 +527,25 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
                 text=text, parse_mode=ParseMode.MARKDOWN,
             )
         except Exception: pass
-        await _replace_floating_keyboard(bot, user_id, chat_id, counts["success"], counts["total"], retry_skip=True)
+        await _replace_floating_keyboard(
+            bot, user_id, chat_id,
+            counts["success"], counts["total"],
+            kb_type=kb_type
+        )
 
+
+# 🚀 UPDATED: shows skipped filenames with "-skip" suffix in final report
 async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False):
     batch = user_batches.pop(user_id, None)
     counts = await _get_batch_counts(user_id)
+
+    # Collect skipped filenames BEFORE deleting
+    skipped_tasks = await db_fetchall(
+        "SELECT filename FROM pending_tasks WHERE user_id = ? AND status = 'skipped' ORDER BY position ASC",
+        [user_id]
+    )
+    skipped_names = [f"{s['filename']}-skip" for s in skipped_tasks]
+
     await db_execute("DELETE FROM pending_tasks WHERE user_id = ?", [user_id])
     cancelled_users.discard(user_id)
 
@@ -476,9 +558,21 @@ async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False)
     if cancelled:
         text = f"❌ *Conversion cancelled.*\n\n✅ Success: *{counts['success']}*"
     else:
-        text = f"🎉 *Conversion finished!*\n\n📦 Total: *{counts['total']}*\n✅ Success: *{counts['success']}*"
+        text = (
+            f"🎉 *Conversion finished!*\n\n"
+            f"📦 Total: *{counts['total']}*\n"
+            f"✅ Success: *{counts['success']}*"
+        )
         if counts["failed"] > 0:
             text += f"\n⚠️ Failed/Skipped: *{counts['failed']}*"
+
+    if skipped_names:
+        text += "\n\n⏭️ *Skipped files:*"
+        for name in skipped_names[:10]:
+            text += f"\n   • `{name}`"
+        if len(skipped_names) > 10:
+            text += f"\n   ... and *{len(skipped_names) - 10}* more"
+
     try:
         await bot.send_message(
             chat_id=chat_id, text=text + "\n\n👇 Use the menu below.",
@@ -564,18 +658,21 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id)
                 return
 
-            # 🚀 Check if this file crashed the server 5 times
-            if task.get("crash_count", 0) >= MAX_RETRIES:
+            # 🚀 If this file caused server crash → prompt user IMMEDIATELY (not after 5 crashes)
+            crash_count = task.get("crash_count", 0) or 0
+            if crash_count >= 1:
                 await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
-                await show_retry_skip_prompt(bot, user_id, chat_id, task, f"Server crashed {task['crash_count']} times while processing this file. It might be too large or corrupted.")
+                await show_retry_skip_prompt(
+                    bot, user_id, chat_id, task,
+                    f"Server crashed {crash_count} time(s) while processing this file. It may be too large."
+                )
                 return
 
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task["id"]])
 
             result = None
-            attempt = task.get("retry_count", 0)
-            
-            # 🚀 Auto Retry Loop (5 times)
+            attempt = task.get("retry_count", 0) or 0
+
             while attempt < MAX_RETRIES:
                 if user_id in cancelled_users:
                     result = {"status": "cancelled", "error": "User cancelled"}
@@ -605,8 +702,10 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id, cancelled=True)
                 return
 
-            # Failed after 5 auto-retries → prompt user
+            # Failed after auto-retries → prompt user
             await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
+            # Refresh task to get latest user_retry_count
+            task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ?", [task["id"]])
             await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Failed after max retries"))
             return
 
@@ -618,8 +717,8 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
         active_processing.discard(user_id)
 
 
+# 🚀 UPDATED: detect crashed tasks first and prompt user, instead of blindly resuming
 async def resume_user_processing(bot, user_id: int, chat_id: int):
-    # 🚀 Any task that was 'processing' means the server crashed (incremented in on_startup)
     counts = await _get_batch_counts(user_id)
     if counts["total"] == 0: return
 
@@ -640,6 +739,19 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
         }
     except Exception: return
 
+    # First check for crashed tasks → prompt user with warning
+    crashed_task = await db_fetchone(
+        "SELECT * FROM pending_tasks WHERE user_id = ? AND crash_count >= 1 AND status IN ('pending','awaiting_retry') ORDER BY position ASC, id ASC LIMIT 1",
+        [user_id]
+    )
+    if crashed_task:
+        await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [crashed_task["id"]])
+        await show_retry_skip_prompt(
+            bot, user_id, chat_id, crashed_task,
+            f"Server crashed {crashed_task['crash_count']} time(s) while processing this file. It may be too large or corrupted."
+        )
+        return
+
     awaiting = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
     if awaiting:
         await show_retry_skip_prompt(bot, user_id, chat_id, awaiting, "Previous error (resumed after restart)")
@@ -648,7 +760,7 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (Memory Safe with FFmpeg Fallback)
+# IMAGE CONVERSION LOGIC
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -660,7 +772,6 @@ def safe_unlink(path: Path) -> None:
     except: pass
 
 def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUALITY) -> None:
-    # 🚀 1. Try FFmpeg first (handles 108MP HEIC files gracefully without OOM)
     if input_file.suffix.lower() in {".heic", ".heif"}:
         try:
             subprocess.run(
@@ -672,17 +783,15 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
             )
             if output_file.exists() and output_file.stat().st_size > 0:
-                return  # FFmpeg succeeded!
+                return
         except Exception as e:
             logger.warning(f"FFmpeg failed or not installed. Falling back to Pillow: {e}")
 
-    # 🚀 2. Fallback to Pillow
     image = None
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
             try:
-                # pillow_heif >= 0.16.0
                 heif = pillow_heif.open_heif(
                     str(input_file),
                     convert_hdr_to_8bit=True,
@@ -690,7 +799,6 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
                 )
             except TypeError:
                 try:
-                    # pillow_heif < 0.16.0
                     heif = pillow_heif.open_heif(
                         str(input_file),
                         convert_hdr_to_8bit=True,
@@ -989,7 +1097,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_supported_file(filename):
         await message.reply_text("❌ *Unsupported file type.*", parse_mode="Markdown")
         return
-        
+
     if (document.file_size or 0) > MAX_FILE_SIZE_BYTES:
         await message.reply_text(f"❌ *File is too large.*\nMaximum size is {MAX_FILE_SIZE_MB}MB.", parse_mode="Markdown")
         return
@@ -1102,7 +1210,7 @@ async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYP
     message, user = update.message, update.effective_user
     if not user: return
     context.user_data.pop("limit_warned", None)
-    
+
     count = len(user_uploads.get(user.id, []))
     user_uploads[user.id] = []
     if "last_status_msg" in context.user_data:
@@ -1137,6 +1245,7 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text("⏳ Stopping after current file...")
 
 
+# 🚀 UPDATED: increments user_retry_count, blocks after MAX_USER_RETRIES
 async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
@@ -1154,16 +1263,34 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("✅ No failed file to retry.", reply_markup=get_main_keyboard(user_id))
         return
 
-    # 🚀 Reset BOTH retry_count and crash_count so it gets another 5 attempts
+    user_retries = task.get("user_retry_count", 0) or 0
+    if user_retries >= MAX_USER_RETRIES:
+        await message.reply_text(
+            f"❌ *Maximum retries reached for* `{task['filename']}`.\n\n"
+            f"Please tap *⏭️ Skip This File* to continue.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_skip_only_keyboard()
+        )
+        return
+
+    # Reset internal auto-retry counter, bump user retry counter
     await db_execute(
-        "UPDATE pending_tasks SET status = 'pending', retry_count = 0, crash_count = 0 WHERE id = ?",
+        "UPDATE pending_tasks SET status = 'pending', retry_count = 0, user_retry_count = user_retry_count + 1 WHERE id = ?",
         [task["id"]]
     )
-    
+
+    # Switch keyboard back to normal processing state
+    await _replace_floating_keyboard(
+        context.bot, user_id, chat_id,
+        (await _get_batch_counts(user_id))["success"],
+        (await _get_batch_counts(user_id))["total"],
+        kb_type="processing"
+    )
     await update_progress_display(context.bot, user_id, chat_id, force_kb_update=True)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
+# 🚀 UPDATED: records skipped file as "FILENAME-skip"
 async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
@@ -1182,8 +1309,20 @@ async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
-    spawn(record_conversion(user_id, task["filename"], "failed", task["source"], task["file_size"], None, task["file_id"]))
-    
+
+    # 🚀 Record skipped with "-skip" suffix
+    skip_filename = f"{task['filename']}-skip"
+    spawn(record_conversion(
+        user_id, skip_filename, "failed",
+        task["source"], task["file_size"], None, task["file_id"]
+    ))
+
+    await _replace_floating_keyboard(
+        context.bot, user_id, chat_id,
+        (await _get_batch_counts(user_id))["success"],
+        (await _get_batch_counts(user_id))["total"],
+        kb_type="processing"
+    )
     await update_progress_display(context.bot, user_id, chat_id, force_kb_update=True)
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
@@ -1335,7 +1474,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_startup(application: Application) -> None:
     await init_database()
 
-    # 🚀 Increment crash count for tasks that were processing (meaning server crashed)
+    # Mark previously processing tasks as crashed
     await db_execute("UPDATE pending_tasks SET status = 'pending', crash_count = crash_count + 1 WHERE status = 'processing'")
 
     users_with_tasks = await db_fetchall(
@@ -1370,16 +1509,13 @@ def main() -> None:
         .build()
     )
 
-    # Command Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("cancel", handle_cancel_conversion))
 
-    # Callback Handlers
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm_"))
 
-    # Message Handlers (Keyboard & Text)
     application.add_handler(MessageHandler(filters.Regex(r"^👑 Admin Panel$"), admin_command))
     application.add_handler(MessageHandler(filters.Regex(r"^👥 All Users$"), admin_all_users_btn))
     application.add_handler(MessageHandler(filters.Regex(r"^🔍 Search User$"), admin_search_btn))
@@ -1395,6 +1531,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
