@@ -1,10 +1,9 @@
 """
 Image → JPG Telegram Bot with Turso (Complete Professional Edition)
 ===================================================================
-✅ NEW: Skip files show as "FILENAME-skip" in history
-✅ NEW: Floating crash warning when large files cause server OOM
-✅ NEW: Retry button disappears after 3 attempts (only Skip remains)
-✅ NEW: Auto-detect crashed files on server restart and prompt user
+✅ NEW: Auto-skip files on server crash (No user approval needed)
+✅ NEW: Skipped files show as "FILENAME-skip position X" in history
+✅ NEW: Auto-recovery on startup prevents endless crash loops
 """
 
 from __future__ import annotations
@@ -93,7 +92,7 @@ Image.MAX_IMAGE_PIXELS = None
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Retry limits
+# 🚀 Limits & Retries
 MAX_RETRIES = 3            # Auto retry attempts per task (internal)
 MAX_USER_RETRIES = 3       # User-facing "Try Again" clicks before only Skip remains
 MAX_BATCH_SIZE = 1000
@@ -165,7 +164,6 @@ def get_retry_skip_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboard
         one_time_keyboard=False
     )
 
-# 🚀 NEW: Skip-only keyboard (after 3 retries exhausted)
 def get_skip_only_keyboard(completed: int = 0, total: int = 0) -> ReplyKeyboardMarkup:
     btn_text = f"🔄 Progress: {completed}/{total}" if total > 0 else "🔄 Converting..."
     return ReplyKeyboardMarkup(
@@ -466,28 +464,12 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
     safe_fn = str(task['filename']).replace('`', '')
 
     user_retries = task.get("user_retry_count", 0) or 0
-    crash_count = task.get("crash_count", 0) or 0
     can_retry = user_retries < MAX_USER_RETRIES
-
-    # 🚀 Crash / large-file warning
-    warning = ""
-    if crash_count > 0:
-        file_size_mb = (task.get("file_size", 0) or 0) / (1024 * 1024)
-        size_line = ""
-        if file_size_mb > MAX_FILE_SIZE_MB * 0.6:
-            size_line = f"\n   📦 File size: *{file_size_mb:.1f}MB* (close to {MAX_FILE_SIZE_MB}MB limit)"
-        warning = (
-            f"\n🚨 *WARNING: Server Crash Detected!*\n"
-            f"   This file caused the server to crash *{crash_count}* time(s).\n"
-            f"   The file may be *too large* or *corrupted*.{size_line}\n"
-            f"   💡 *Recommended:* Tap *⏭️ Skip This File* to continue safely.\n"
-        )
 
     text = (
         f"⚠️ *Conversion failed!*\n\n"
         f"📄 File: `{safe_fn}`\n"
-        f"❗ Error: `{safe_err}`\n"
-        f"{warning}\n"
+        f"❗ Error: `{safe_err}`\n\n"
         f"📊 Progress: *{counts['success']}/{counts['total']}*\n"
         f"🔁 Retries used: *{user_retries}/{MAX_USER_RETRIES}*\n\n"
     )
@@ -534,17 +516,17 @@ async def show_retry_skip_prompt(bot, user_id: int, chat_id: int, task: dict, er
         )
 
 
-# 🚀 UPDATED: shows skipped filenames with "-skip" suffix in final report
+# 🚀 UPDATED: shows skipped filenames with "-skip position X" suffix in final report
 async def finish_batch(bot, user_id: int, chat_id: int, cancelled: bool = False):
     batch = user_batches.pop(user_id, None)
     counts = await _get_batch_counts(user_id)
 
-    # Collect skipped filenames BEFORE deleting
+    # Collect skipped filenames and positions BEFORE deleting
     skipped_tasks = await db_fetchall(
-        "SELECT filename FROM pending_tasks WHERE user_id = ? AND status = 'skipped' ORDER BY position ASC",
+        "SELECT filename, position FROM pending_tasks WHERE user_id = ? AND status = 'skipped' ORDER BY position ASC",
         [user_id]
     )
-    skipped_names = [f"{s['filename']}-skip" for s in skipped_tasks]
+    skipped_names = [f"{s['filename']}-skip position {s['position']}" for s in skipped_tasks]
 
     await db_execute("DELETE FROM pending_tasks WHERE user_id = ?", [user_id])
     cancelled_users.discard(user_id)
@@ -658,15 +640,29 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id)
                 return
 
-            # 🚀 If this file caused server crash → prompt user IMMEDIATELY (not after 5 crashes)
+            # 🚀 AUTO-SKIP IF SERVER CRASHED (No user approval needed)
             crash_count = task.get("crash_count", 0) or 0
             if crash_count >= 1:
-                await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
-                await show_retry_skip_prompt(
-                    bot, user_id, chat_id, task,
-                    f"Server crashed {crash_count} time(s) while processing this file. It may be too large."
-                )
-                return
+                await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
+                skip_filename = f"{task['filename']}-skip position {task['position']}"
+                spawn(record_conversion(user_id, skip_filename, "failed", task["source"], task["file_size"], None, task["file_id"]))
+                
+                # Notify user about the auto-skip
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚨 *Server Crash Auto-Skip*\n\n"
+                             f"📄 File: `{task['filename']}`\n"
+                             f"📌 Position: `{task['position']}`\n\n"
+                             f"⚠️ This file caused the server to crash. It has been automatically skipped to prevent further crashes.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    pass
+                
+                await update_progress_display(bot, user_id, chat_id, force_kb_update=True)
+                await asyncio.sleep(1) # Small delay to prevent Telegram rate limits
+                continue
 
             await db_execute("UPDATE pending_tasks SET status = 'processing' WHERE id = ?", [task["id"]])
 
@@ -702,9 +698,8 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
                 await finish_batch(bot, user_id, chat_id, cancelled=True)
                 return
 
-            # Failed after auto-retries → prompt user
+            # Failed after auto-retries → prompt user (for normal errors, not OOM crashes)
             await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [task["id"]])
-            # Refresh task to get latest user_retry_count
             task = await db_fetchone("SELECT * FROM pending_tasks WHERE id = ?", [task["id"]])
             await show_retry_skip_prompt(bot, user_id, chat_id, task, result.get("error", "Failed after max retries"))
             return
@@ -717,7 +712,7 @@ async def process_user_queue(bot, user_id: int, chat_id: int):
         active_processing.discard(user_id)
 
 
-# 🚀 UPDATED: detect crashed tasks first and prompt user, instead of blindly resuming
+# 🚀 UPDATED: simplifies resume logic; process_user_queue will auto-skip crashed files
 async def resume_user_processing(bot, user_id: int, chat_id: int):
     counts = await _get_batch_counts(user_id)
     if counts["total"] == 0: return
@@ -739,23 +734,12 @@ async def resume_user_processing(bot, user_id: int, chat_id: int):
         }
     except Exception: return
 
-    # First check for crashed tasks → prompt user with warning
-    crashed_task = await db_fetchone(
-        "SELECT * FROM pending_tasks WHERE user_id = ? AND crash_count >= 1 AND status IN ('pending','awaiting_retry') ORDER BY position ASC, id ASC LIMIT 1",
-        [user_id]
-    )
-    if crashed_task:
-        await db_execute("UPDATE pending_tasks SET status = 'awaiting_retry' WHERE id = ?", [crashed_task["id"]])
-        await show_retry_skip_prompt(
-            bot, user_id, chat_id, crashed_task,
-            f"Server crashed {crashed_task['crash_count']} time(s) while processing this file. It may be too large or corrupted."
-        )
-        return
-
+    # Check for awaiting_retry tasks from before the restart
     awaiting = await db_fetchone("SELECT * FROM pending_tasks WHERE user_id = ? AND status = 'awaiting_retry' ORDER BY position ASC, id ASC LIMIT 1", [user_id])
     if awaiting:
         await show_retry_skip_prompt(bot, user_id, chat_id, awaiting, "Previous error (resumed after restart)")
     else:
+        # Start the queue. If there are crashed files (crash_count >= 1) they will be auto-skipped.
         spawn(process_user_queue(bot, user_id, chat_id))
 
 
@@ -1245,7 +1229,6 @@ async def handle_cancel_conversion(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text("⏳ Stopping after current file...")
 
 
-# 🚀 UPDATED: increments user_retry_count, blocks after MAX_USER_RETRIES
 async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
@@ -1290,7 +1273,7 @@ async def handle_retry_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     spawn(process_user_queue(context.bot, user_id, chat_id))
 
 
-# 🚀 UPDATED: records skipped file as "FILENAME-skip"
+# 🚀 UPDATED: records skipped file as "FILENAME-skip position X"
 async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.message, update.effective_user
     if not user: return
@@ -1310,8 +1293,8 @@ async def handle_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await db_execute("UPDATE pending_tasks SET status = 'skipped' WHERE id = ?", [task["id"]])
 
-    # 🚀 Record skipped with "-skip" suffix
-    skip_filename = f"{task['filename']}-skip"
+    # 🚀 Record skipped with "-skip position X" suffix
+    skip_filename = f"{task['filename']}-skip position {task['position']}"
     spawn(record_conversion(
         user_id, skip_filename, "failed",
         task["source"], task["file_size"], None, task["file_id"]
