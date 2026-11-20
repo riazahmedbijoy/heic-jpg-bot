@@ -5,7 +5,7 @@ Image → JPG Telegram Bot with Turso (Professional Queue Edition)
 ✅ Retained Queue Worker & Positioning
 ✅ Auto-Skip on Crash (Sends only "filename-skip position X")
 ✅ Memory Optimized to prevent Render OOM
-✅ Fixed Temp File Cleanup & Proper Error Logging
+✅ Fixed HEIC scaling API (Removed heif.scale, using PIL thumbnail)
 """
 
 from __future__ import annotations
@@ -84,21 +84,21 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif",
 }
 
-# 🚀 Reduced to 2048 to prevent Render 512MB RAM crash (OOM)
+# Max dimension to prevent Render 512MB RAM crash (OOM)
 MAX_DIMENSION = 2048 
 Image.MAX_IMAGE_PIXELS = None
 
 USERS_PER_PAGE = 8
 CONVS_PER_PAGE = 8
 
-# 🚀 Concurrency & Retries
+# Concurrency & Retries
 MAX_WORKERS = 1  
 MAX_RETRIES = 3
 CONVERSION_TIMEOUT = 120 # 2 Minutes
 
 conversion_queue = asyncio.Queue()
 
-# 🚀 State Tracking
+# State Tracking
 user_uploads: dict[int, list[dict]] = {}
 user_batches: dict[int, dict] = {}
 cancelled_users: set[int] = set()
@@ -301,7 +301,7 @@ async def record_conversion(user_id: int, filename: str, status: str, source: st
     except: pass
 
 # ===========================================================================
-# ADMIN HELPERS (Shortened for brevity, original logic retained)
+# ADMIN HELPERS
 # ===========================================================================
 async def payment_summary(user_id: int) -> dict:
     row = await db_fetchone("SELECT COUNT(*) AS count, COALESCE(SUM(stars), 0) AS stars FROM payments WHERE user_id = ?", [user_id])
@@ -336,7 +336,7 @@ async def search_users(query: str, limit: int = 30) -> list[dict]:
 
 
 # ===========================================================================
-# 🚀 QUEUE WORKER LOGIC (Fully Fixed & Memory Optimized)
+# 🚀 QUEUE WORKER LOGIC
 # ===========================================================================
 async def update_progress(bot, batch, text):
     try:
@@ -515,7 +515,6 @@ async def queue_worker(application: Application, worker_id: int):
             logger.error(f"Worker global error: {e}")
             await asyncio.sleep(5)
         finally:
-            # 🚀 CRITICAL FIX: Cleanup ALWAYS runs, and task_done is ALWAYS called
             try:
                 if 'input_file' in locals() and input_file: safe_unlink(input_file)
                 if 'output_file' in locals() and output_file: safe_unlink(output_file)
@@ -527,7 +526,7 @@ async def queue_worker(application: Application, worker_id: int):
 
 
 # ===========================================================================
-# IMAGE CONVERSION LOGIC (Fully Fixed & Logged)
+# IMAGE CONVERSION LOGIC (FIXED)
 # ===========================================================================
 class ConversionError(Exception): pass
 
@@ -543,19 +542,19 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
     heif = None
     try:
         if input_file.suffix.lower() in {".heic", ".heif"}:
+            # Open HEIF and convert to a Pillow Image
             heif = pillow_heif.open_heif(str(input_file), convert_hdr_to_8bit=True)
-            w, h = heif.size
-            if w > MAX_DIMENSION or h > MAX_DIMENSION:
-                heif = heif.scale(min(MAX_DIMENSION / w, MAX_DIMENSION / h))
             image = heif.to_pillow()
         else:
             image = Image.open(input_file)
             try: image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
             except: pass
 
+        # Resize using Pillow's thumbnail (works for both HEIC and standard images)
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
+        # Handle transparency / color modes
         if image.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", image.size, (255, 255, 255))
             bg.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
@@ -577,7 +576,7 @@ def convert_to_jpg(input_file: Path, output_file: Path, quality: int = JPEG_QUAL
 
 
 # ===========================================================================
-# UI BUILDERS (Admin Panel - Kept exact same as original for brevity)
+# UI BUILDERS (Admin Panel)
 # ===========================================================================
 def dashboard_text(stats: dict) -> str:
     return (
